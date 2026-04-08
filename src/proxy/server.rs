@@ -42,29 +42,42 @@ impl ProxyServer {
         );
 
         loop {
-            let (socket, peer_addr) = listener.accept().await?;
-            info!(%peer_addr, "Accepted connection");
+            tokio::select! {
+                result = listener.accept() => {
+                    let (socket, peer_addr) = result?;
+                    info!(%peer_addr, "Accepted connection");
 
-            let upstream_addr = self.upstream_addr.clone();
-            let upstream_user = self.upstream_user.clone();
-            let upstream_password = self.upstream_password.clone();
-            let overlay_dir = self.overlay_dir.clone();
+                    let upstream_addr = self.upstream_addr.clone();
+                    let upstream_user = self.upstream_user.clone();
+                    let upstream_password = self.upstream_password.clone();
+                    let overlay_dir = self.overlay_dir.clone();
 
-            tokio::spawn(async move {
-                let handler = CowHandler::new(upstream_addr, upstream_user, upstream_password, overlay_dir);
+                    tokio::spawn(async move {
+                        let handler = CowHandler::new(upstream_addr, upstream_user, upstream_password, overlay_dir);
 
-                // Split the TCP stream into read/write halves for opensrv-mysql
-                let (reader, writer) = socket.into_split();
+                        // Split the TCP stream into read/write halves for opensrv-mysql
+                        let (reader, writer) = socket.into_split();
 
-                match AsyncMysqlIntermediary::run_on(handler, reader, writer).await {
-                    Ok(()) => {
-                        info!(%peer_addr, "Client disconnected cleanly");
-                    }
-                    Err(e) => {
-                        error!(%peer_addr, error = %e, "Connection error");
-                    }
+                        match AsyncMysqlIntermediary::run_on(handler, reader, writer).await {
+                            Ok(()) => {
+                                info!(%peer_addr, "Client disconnected cleanly");
+                            }
+                            Err(e) => {
+                                error!(%peer_addr, error = %e, "Connection error");
+                            }
+                        }
+                    });
                 }
-            });
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received shutdown signal, stopping...");
+                    break;
+                }
+            }
         }
+
+        // Give active connections a moment to finish
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        info!("Proxy stopped.");
+        Ok(())
     }
 }
