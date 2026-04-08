@@ -260,7 +260,7 @@ impl CowHandler {
         let rows: Vec<mysql_async::Row> = conn
             .query(&sql)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("SHOW COLUMNS failed: {e}")))?;
+            .map_err(|e| io::Error::other(format!("SHOW COLUMNS failed: {e}")))?;
 
         let mut columns = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -340,7 +340,7 @@ impl CowHandler {
             .query(&sql)
             .await
             .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("FK metadata query failed: {e}"))
+                io::Error::other(format!("FK metadata query failed: {e}"))
             })?;
 
         let mut relations = Vec::new();
@@ -423,8 +423,7 @@ impl CowHandler {
 
             let child_pks: Vec<String> = if let Some(ref mut conn) = self.upstream {
                 let rows: Vec<Row> = conn.query(&select_sql).await.map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("FK check query failed on {}: {e}", fk.child_table),
                     )
                 })?;
@@ -447,8 +446,7 @@ impl CowHandler {
 
             match fk.on_delete {
                 FkAction::Restrict | FkAction::NoAction => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         format!(
                             "Cannot delete or update a parent row: a foreign key constraint fails \
                              (`{}`.`{}`, CONSTRAINT FOREIGN KEY (`{}`) REFERENCES `{}` (`{}`))",
@@ -476,8 +474,7 @@ impl CowHandler {
                     // SET DEFAULT is rare and not well-supported by MySQL/MariaDB InnoDB.
                     // Treat as RESTRICT for safety.
                     if !child_pks.is_empty() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
+                        return Err(io::Error::other(
                             format!(
                                 "Cannot delete or update a parent row: a foreign key constraint fails \
                                  (SET DEFAULT not supported, `{}`.`{}`)",
@@ -502,8 +499,7 @@ impl CowHandler {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<()>> + Send + 'a>> {
         Box::pin(async move {
         if depth > 10 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "FK cascade depth exceeded (max 10)",
             ));
         }
@@ -556,8 +552,7 @@ impl CowHandler {
 
             let upstream_rows: Vec<Vec<(String, String)>> = if let Some(ref mut conn) = self.upstream {
                 let rows: Vec<Row> = conn.query(&select_sql).await.map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("FK SET NULL fetch failed on {}: {e}", child_table),
                     )
                 })?;
@@ -585,8 +580,7 @@ impl CowHandler {
             // (OverlayStore uses rusqlite which is !Send — open, use, drop before .await)
             {
                 let store = OverlayStore::open(&self.overlay_dir, &db).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("Failed to open overlay for FK SET NULL: {e}"),
                     )
                 })?;
@@ -597,8 +591,7 @@ impl CowHandler {
                     .map(|(n, t)| (n.as_str(), t.as_str()))
                     .collect();
                 row_store.ensure_shadow_table(child_table, &col_refs).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("Failed to ensure shadow table for FK SET NULL: {e}"),
                     )
                 })?;
@@ -662,8 +655,7 @@ impl CowHandler {
                             .conn
                             .execute(&update_sql, rusqlite::params![cow_pk])
                             .map_err(|e| {
-                                io::Error::new(
-                                    io::ErrorKind::Other,
+                                io::Error::other(
                                     format!("FK SET NULL overlay update failed: {e}"),
                                 )
                             })?;
@@ -678,8 +670,7 @@ impl CowHandler {
                         let params: Vec<&dyn rusqlite::types::ToSql> =
                             values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
                         store.conn.execute(&insert_sql, params.as_slice()).map_err(|e| {
-                            io::Error::new(
-                                io::ErrorKind::Other,
+                            io::Error::other(
                                 format!("FK SET NULL overlay insert failed: {e}"),
                             )
                         })?;
@@ -690,8 +681,7 @@ impl CowHandler {
                 let reg = crate::overlay::registry::Registry::new(&store.conn);
                 reg.mark_dirty(child_table, crate::overlay::registry::DirtyKind::Data)
                     .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
+                        io::Error::other(
                             format!("Failed to mark {} as dirty: {e}", child_table),
                         )
                     })?;
@@ -715,8 +705,7 @@ impl CowHandler {
             // Open overlay store, write tombstones for the child rows
             {
                 let store = OverlayStore::open(&self.overlay_dir, &db).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("Failed to open overlay for FK CASCADE: {e}"),
                     )
                 })?;
@@ -727,8 +716,7 @@ impl CowHandler {
                     .map(|(n, t)| (n.as_str(), t.as_str()))
                     .collect();
                 row_store.ensure_shadow_table(child_table, &col_refs).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("Failed to ensure shadow table for FK CASCADE: {e}"),
                     )
                 })?;
@@ -755,8 +743,7 @@ impl CowHandler {
                                     rusqlite::params![pk],
                                 )
                                 .map_err(|e| {
-                                    io::Error::new(
-                                        io::ErrorKind::Other,
+                                    io::Error::other(
                                         format!("FK CASCADE delete overlay-only row failed: {e}"),
                                     )
                                 })?;
@@ -773,8 +760,7 @@ impl CowHandler {
                                     rusqlite::params![pk],
                                 )
                                 .map_err(|e| {
-                                    io::Error::new(
-                                        io::ErrorKind::Other,
+                                    io::Error::other(
                                         format!("FK CASCADE tombstone update failed: {e}"),
                                     )
                                 })?;
@@ -791,8 +777,7 @@ impl CowHandler {
                                     rusqlite::params![pk],
                                 )
                                 .map_err(|e| {
-                                    io::Error::new(
-                                        io::ErrorKind::Other,
+                                    io::Error::other(
                                         format!("FK CASCADE tombstone insert failed: {e}"),
                                     )
                                 })?;
@@ -804,8 +789,7 @@ impl CowHandler {
                 let reg = crate::overlay::registry::Registry::new(&store.conn);
                 reg.mark_dirty(child_table, crate::overlay::registry::DirtyKind::Data)
                     .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
+                        io::Error::other(
                             format!("Failed to mark {} as dirty: {e}", child_table),
                         )
                     })?;
@@ -991,8 +975,7 @@ impl CowHandler {
 
                         // Collect all rows
                         let rows: Vec<Row> = result.collect().await.map_err(|e| {
-                            io::Error::new(
-                                io::ErrorKind::Other,
+                            io::Error::other(
                                 format!("upstream error: {}", e),
                             )
                         })?;
@@ -1759,7 +1742,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                         let opensrv_cols = build_opensrv_columns(&cols);
 
                         let rows: Vec<Row> = result.collect().await.map_err(|e| {
-                            io::Error::new(io::ErrorKind::Other, format!("upstream error: {}", e))
+                            io::Error::other(format!("upstream error: {}", e))
                         })?;
                         drop(result);
 
@@ -2029,7 +2012,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                     };
                     let show_sql = format!("SHOW CREATE PROCEDURE `{}`", proc_name);
                     let row: Option<mysql_async::Row> = conn.query_first(&show_sql).await
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to fetch SP: {e}")))?;
+                        .map_err(|e| io::Error::other(format!("Failed to fetch SP: {e}")))?;
                     match row {
                         Some(r) => {
                             // Column 2 is typically "Create Procedure"

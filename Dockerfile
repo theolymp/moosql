@@ -1,0 +1,16 @@
+FROM rust:1.86-slim AS builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/moo /usr/local/bin/moo
+
+ENTRYPOINT ["moo"]
+CMD ["start", "--listen=0.0.0.0:3307"]
