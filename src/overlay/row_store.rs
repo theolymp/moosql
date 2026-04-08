@@ -4,6 +4,7 @@ pub struct RowStore<'a> {
     conn: &'a Connection,
 }
 
+#[allow(dead_code)]
 pub struct OverlayRow {
     pub pk: String,
     pub op: String,
@@ -43,6 +44,7 @@ impl<'a> RowStore<'a> {
     }
 
     /// Returns all overlay rows for the given table.
+    #[allow(dead_code)]
     pub fn get_overlay_rows(&self, table: &str) -> SqlResult<Vec<OverlayRow>> {
         let shadow = format!("_cow_data_{table}");
         let mut stmt = self
@@ -107,6 +109,7 @@ impl<'a> RowStore<'a> {
     }
 
     /// Returns the primary keys of rows that have been tombstoned (DELETE operation).
+    #[allow(dead_code)]
     pub fn get_tombstone_pks(&self, table: &str) -> SqlResult<Vec<String>> {
         let shadow = format!("_cow_data_{table}");
         let mut stmt = self.conn.prepare(&format!(

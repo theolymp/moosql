@@ -35,6 +35,7 @@ impl<'a> SequenceTracker<'a> {
     }
 
     /// Returns the most recently issued ID (next_value + 1), or None if no ID has been issued yet.
+    #[allow(dead_code)]
     pub fn last_id(&self, table: &str) -> SqlResult<Option<i64>> {
         let result: Option<i64> = self
             .conn

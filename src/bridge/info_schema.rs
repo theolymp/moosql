@@ -16,6 +16,7 @@
 /// assert!(is_info_schema_query("SELECT * FROM INFORMATION_SCHEMA.TABLES"));
 /// assert!(!is_info_schema_query("SELECT * FROM users"));
 /// ```
+#[allow(dead_code)]
 pub fn is_info_schema_query(sql: &str) -> bool {
     sql.to_uppercase().contains("INFORMATION_SCHEMA.")
 }
@@ -24,6 +25,7 @@ pub fn is_info_schema_query(sql: &str) -> bool {
 ///
 /// When overlay operations add new columns, this structure captures the metadata
 /// needed to patch query results so they reflect the new schema.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OverlayColumn {
     pub table_schema: String,
@@ -39,6 +41,7 @@ pub struct OverlayColumn {
 ///
 /// When overlay operations create new tables, this structure captures the metadata
 /// needed to patch query results so they reflect the new table definitions.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OverlayTable {
     pub table_schema: String,

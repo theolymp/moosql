@@ -75,6 +75,7 @@ pub struct TablesArgs {
 }
 
 /// Top-level config file structure
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfigFile {
     pub upstream: Option<UpstreamConfig>,
@@ -82,6 +83,7 @@ pub struct ConfigFile {
     pub overlay: Option<OverlayConfig>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct UpstreamConfig {
     pub host: Option<String>,
@@ -90,11 +92,13 @@ pub struct UpstreamConfig {
     pub password: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct ProxyConfig {
     pub listen: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct OverlayConfig {
     pub path: Option<PathBuf>,

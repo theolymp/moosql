@@ -7,6 +7,7 @@ use crate::overlay::store::OverlayStore;
 
 pub struct OverlayStatus {
     pub dirty_tables: usize,
+    #[allow(dead_code)]
     pub total_rows: usize,
     pub databases: Vec<String>,
 }

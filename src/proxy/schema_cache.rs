@@ -8,6 +8,7 @@ pub struct ForeignKeyInfo {
     pub parent_table: String,
     pub parent_column: String,
     pub on_delete: FkAction,
+    #[allow(dead_code)]
     pub on_update: FkAction,
 }
 
@@ -90,6 +91,7 @@ impl SchemaCache {
         self.cache.remove(table);
     }
 
+    #[allow(dead_code)]
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
     }

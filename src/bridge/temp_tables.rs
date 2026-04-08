@@ -138,6 +138,7 @@ impl TempTableManager {
     }
 
     /// Clears all tracked tables.
+    #[allow(dead_code)]
     pub fn invalidate_all(&mut self) {
         self.created.clear();
     }

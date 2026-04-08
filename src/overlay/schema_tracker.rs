@@ -29,6 +29,7 @@ impl<'a> SchemaTracker<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_overlay_schema(&self, table: &str) -> SqlResult<Option<String>> {
         self.conn
             .query_row(
@@ -40,6 +41,7 @@ impl<'a> SchemaTracker<'a> {
             .map(|opt| opt.flatten())
     }
 
+    #[allow(dead_code)]
     pub fn get_base_schema(&self, table: &str) -> SqlResult<Option<String>> {
         self.conn
             .query_row(

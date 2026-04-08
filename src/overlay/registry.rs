@@ -4,6 +4,7 @@ use rusqlite::{Connection, Result as SqlResult};
 pub enum DirtyKind {
     Data,
     Schema,
+    #[allow(dead_code)]
     Both,
 }
 
@@ -23,6 +24,7 @@ impl<'a> Registry<'a> {
         Self { conn }
     }
 
+    #[allow(dead_code)]
     pub fn is_dirty(&self, table: &str) -> SqlResult<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM _cow_tables WHERE table_name = ?1",

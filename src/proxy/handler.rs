@@ -849,10 +849,8 @@ impl CowHandler {
                 }
             };
 
-            if overlay_data.is_empty() && !self.truncated_tables.contains(table) {
-                debug!(conn_id = self.conn_id, table = %table, "No overlay rows; skipping temp table");
-                continue;
-            }
+            // Always create temp tables for dirty tables (even if empty),
+            // so the rewritten queries can reference them without errors.
 
             // Build the column definitions for ensure_temp_table (exclude _cow_pk / _cow_op —
             // those are added automatically by TempTableManager).
