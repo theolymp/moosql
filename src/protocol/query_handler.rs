@@ -32,11 +32,8 @@ pub fn route_query(
 
     match parsed {
         QueryKind::Unparseable(raw) => {
-            // Unparseable queries are forwarded to upstream as passthrough.
-            // This is safer than rejecting: SHOW variants, SET with complex syntax,
-            // and other MySQL-specific statements that sqlparser doesn't handle
-            // will still work. Writes that slip through are harmless because
-            // the upstream connection is used read-only in practice.
+            // Forward unparseable queries to upstream — covers SHOW variants and
+            // MySQL-specific syntax that sqlparser doesn't handle.
             QueryAction::Passthrough(raw)
         }
 

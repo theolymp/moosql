@@ -24,6 +24,32 @@ use crate::sql::parser::TransactionOp;
 
 static CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 
+/// Convert a `mysql_async::Value` to a display string.
+fn mysql_value_to_string(v: &mysql_async::Value) -> String {
+    match v {
+        mysql_async::Value::NULL => "NULL".to_string(),
+        mysql_async::Value::Bytes(b) => String::from_utf8_lossy(b).to_string(),
+        mysql_async::Value::Int(n) => n.to_string(),
+        mysql_async::Value::UInt(n) => n.to_string(),
+        mysql_async::Value::Float(f) => f.to_string(),
+        mysql_async::Value::Double(d) => d.to_string(),
+        other => format!("{:?}", other),
+    }
+}
+
+/// Convert a `mysql_async::Value` to an optional byte vector for wire-level column writing.
+fn mysql_value_to_bytes(v: &mysql_async::Value) -> Option<Vec<u8>> {
+    match v {
+        mysql_async::Value::NULL => None,
+        mysql_async::Value::Bytes(b) => Some(b.clone()),
+        mysql_async::Value::Int(n) => Some(n.to_string().into_bytes()),
+        mysql_async::Value::UInt(n) => Some(n.to_string().into_bytes()),
+        mysql_async::Value::Float(f) => Some(f.to_string().into_bytes()),
+        mysql_async::Value::Double(d) => Some(d.to_string().into_bytes()),
+        other => Some(format!("{:?}", other).into_bytes()),
+    }
+}
+
 /// Result of FK constraint enforcement for a DELETE operation.
 struct FkResult {
     /// Child tables whose rows should be cascade-deleted: (child_table, child_pks).
@@ -65,6 +91,9 @@ pub struct CowHandler {
     last_insert_id: Option<i64>,
     /// Per-session schema cache: avoids repeated SHOW COLUMNS round-trips.
     schema_cache: SchemaCache,
+    /// Whether the dirty_tables cache needs a re-read from SQLite.
+    /// Set to true initially and after any overlay write; cleared after refresh.
+    dirty_tables_stale: bool,
 }
 
 impl CowHandler {
@@ -90,6 +119,7 @@ impl CowHandler {
             prepared_stmts: HashMap::new(),
             last_insert_id: None,
             schema_cache: SchemaCache::new(),
+            dirty_tables_stale: true,
         }
     }
 
@@ -133,6 +163,9 @@ impl CowHandler {
     /// Refresh the dirty tables list from the overlay store.
     /// Also refreshes the truncated_tables list (tables that have been TRUNCATEd).
     fn refresh_dirty_tables(&mut self) {
+        if !self.dirty_tables_stale {
+            return;
+        }
         if let Some(ref db) = self.current_db {
             match OverlayStore::open(&self.overlay_dir, db) {
                 Ok(store) => {
@@ -157,6 +190,7 @@ impl CowHandler {
                             }
                             self.dirty_tables = table_names;
                             self.truncated_tables = truncated;
+                            self.dirty_tables_stale = false;
                         }
                         Err(e) => {
                             warn!("Failed to list dirty tables: {}", e);
@@ -169,11 +203,13 @@ impl CowHandler {
                     debug!("No overlay store for db {}: {}", db, e);
                     self.dirty_tables.clear();
                     self.truncated_tables.clear();
+                    self.dirty_tables_stale = false;
                 }
             }
         } else {
             self.dirty_tables.clear();
             self.truncated_tables.clear();
+            self.dirty_tables_stale = false;
         }
     }
 
@@ -394,15 +430,7 @@ impl CowHandler {
 
                 rows.iter()
                     .filter_map(|row| {
-                        row.as_ref(0).map(|v| match v {
-                            mysql_async::Value::NULL => "NULL".to_string(),
-                            mysql_async::Value::Bytes(b) => {
-                                String::from_utf8_lossy(b).to_string()
-                            }
-                            mysql_async::Value::Int(n) => n.to_string(),
-                            mysql_async::Value::UInt(n) => n.to_string(),
-                            _ => format!("{:?}", v),
-                        })
+                        row.as_ref(0).map(|v| mysql_value_to_string(v))
                     })
                     .collect()
             } else {
@@ -541,15 +569,7 @@ impl CowHandler {
                             .map(|(i, (col_name, _))| {
                                 let val = row
                                     .as_ref(i)
-                                    .map(|v| match v {
-                                        mysql_async::Value::NULL => "NULL".to_string(),
-                                        mysql_async::Value::Bytes(b) => {
-                                            String::from_utf8_lossy(b).to_string()
-                                        }
-                                        mysql_async::Value::Int(n) => n.to_string(),
-                                        mysql_async::Value::UInt(n) => n.to_string(),
-                                        _ => format!("{:?}", v),
-                                    })
+                                    .map(|v| mysql_value_to_string(v))
                                     .unwrap_or_else(|| "NULL".to_string());
                                 (col_name.clone(), val)
                             })
@@ -998,20 +1018,9 @@ impl CowHandler {
 
                         for row in &rows {
                             for i in 0..num_cols {
-                                // Get value as raw bytes — use try_get to avoid panics
-                                // on values that can't be converted to Vec<u8>.
                                 let val: Option<Vec<u8>> = row
                                     .as_ref(i)
-                                    .map(|v| match v {
-                                        mysql_async::Value::NULL => None,
-                                        mysql_async::Value::Bytes(b) => Some(b.clone()),
-                                        mysql_async::Value::Int(n) => Some(n.to_string().into_bytes()),
-                                        mysql_async::Value::UInt(n) => Some(n.to_string().into_bytes()),
-                                        mysql_async::Value::Float(f) => Some(f.to_string().into_bytes()),
-                                        mysql_async::Value::Double(d) => Some(d.to_string().into_bytes()),
-                                        other => Some(format!("{:?}", other).into_bytes()),
-                                    })
-                                    .flatten();
+                                    .and_then(|v| mysql_value_to_bytes(v));
                                 row_writer.write_col(val)?;
                             }
                             row_writer.end_row().await?;
@@ -1229,16 +1238,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                             for i in 0..num_cols {
                                 let val: Option<Vec<u8>> = row
                                     .as_ref(i)
-                                    .map(|v| match v {
-                                        mysql_async::Value::NULL => None,
-                                        mysql_async::Value::Bytes(b) => Some(b.clone()),
-                                        mysql_async::Value::Int(n) => Some(n.to_string().into_bytes()),
-                                        mysql_async::Value::UInt(n) => Some(n.to_string().into_bytes()),
-                                        mysql_async::Value::Float(f) => Some(f.to_string().into_bytes()),
-                                        mysql_async::Value::Double(d) => Some(d.to_string().into_bytes()),
-                                        other => Some(format!("{:?}", other).into_bytes()),
-                                    })
-                                    .flatten();
+                                    .and_then(|v| mysql_value_to_bytes(v));
                                 row_writer.write_col(val)?;
                             }
                             row_writer.end_row().await?;
@@ -1589,15 +1589,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                                 rows.iter().map(|row| {
                                     schema.iter().enumerate().map(|(i, (col_name, _))| {
                                         let val = row.as_ref(i)
-                                            .map(|v| match v {
-                                                mysql_async::Value::NULL => "NULL".to_string(),
-                                                mysql_async::Value::Bytes(b) => String::from_utf8_lossy(b).to_string(),
-                                                mysql_async::Value::Int(n) => n.to_string(),
-                                                mysql_async::Value::UInt(n) => n.to_string(),
-                                                mysql_async::Value::Float(f) => f.to_string(),
-                                                mysql_async::Value::Double(d) => d.to_string(),
-                                                other => format!("{:?}", other),
-                                            })
+                                            .map(|v| mysql_value_to_string(v))
                                             .unwrap_or_else(|| "NULL".to_string());
                                         (col_name.clone(), val)
                                     }).collect()
@@ -1690,13 +1682,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                                 };
 
                                 rows.iter().filter_map(|row| {
-                                    row.as_ref(0).map(|v| match v {
-                                        mysql_async::Value::NULL => "NULL".to_string(),
-                                        mysql_async::Value::Bytes(b) => String::from_utf8_lossy(b).to_string(),
-                                        mysql_async::Value::Int(n) => n.to_string(),
-                                        mysql_async::Value::UInt(n) => n.to_string(),
-                                        _ => format!("{:?}", v),
-                                    })
+                                    row.as_ref(0).map(|v| mysql_value_to_string(v))
                                 }).collect()
                             } else {
                                 break 'overlay Ok(None);
@@ -1747,13 +1733,9 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                                                 match conn.query::<Row, _>(&fetch_sql).await {
                                                     Ok(rows) => rows.iter().map(|row| {
                                                         child_schema_pairs.iter().enumerate().map(|(i, (col_name, _))| {
-                                                            let val = row.as_ref(i).map(|v| match v {
-                                                                mysql_async::Value::NULL => "NULL".to_string(),
-                                                                mysql_async::Value::Bytes(b) => String::from_utf8_lossy(b).to_string(),
-                                                                mysql_async::Value::Int(n) => n.to_string(),
-                                                                mysql_async::Value::UInt(n) => n.to_string(),
-                                                                _ => format!("{:?}", v),
-                                                            }).unwrap_or_else(|| "NULL".to_string());
+                                                            let val = row.as_ref(i)
+                                                                .map(|v| mysql_value_to_string(v))
+                                                                .unwrap_or_else(|| "NULL".to_string());
                                                             (col_name.clone(), val)
                                                         }).collect()
                                                     }).collect(),
@@ -2019,6 +2001,8 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                         if wr.last_insert_id.is_some() {
                             self.last_insert_id = wr.last_insert_id;
                         }
+                        // Mark dirty cache stale so next query re-reads from SQLite.
+                        self.dirty_tables_stale = true;
                         (wr.affected_rows, wr.last_insert_id.unwrap_or(0) as u64)
                     }
                     None => (overlay_result.affected_rows, overlay_result.last_insert_id.unwrap_or(0) as u64),

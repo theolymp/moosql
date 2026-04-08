@@ -79,52 +79,75 @@ impl TempTableManager {
         conn.query_drop(create_meta_sql).await?;
 
         // --- Populate both tables ---
-        for row in rows {
-            // Always insert into meta table (all ops: insert, update, delete).
-            let meta_insert = format!(
-                "INSERT INTO `{}` (`_cow_pk`, `_cow_op`) VALUES (?, ?)",
-                meta_name
-            );
-            conn.exec_drop(
-                meta_insert,
-                vec![
-                    mysql_async::Value::Bytes(row.pk.as_bytes().to_vec()),
-                    mysql_async::Value::Bytes(row.op.as_bytes().to_vec()),
-                ],
-            )
-            .await?;
+        // Build meta and data inserts as bulk statements (VALUES (?,?),(?,?),...).
+        // Meta table: all ops (insert, update, delete).
+        // Data table: non-tombstone rows only.
 
-            // Only insert into data table for non-tombstone rows.
-            if row.op.to_lowercase() != "delete" && !columns.is_empty() {
+        if !rows.is_empty() {
+            // --- Bulk meta insert ---
+            let meta_placeholders = std::iter::repeat("(?, ?)")
+                .take(rows.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let meta_insert = format!(
+                "INSERT INTO `{}` (`_cow_pk`, `_cow_op`) VALUES {}",
+                meta_name, meta_placeholders
+            );
+            let meta_params: Vec<mysql_async::Value> = rows
+                .iter()
+                .flat_map(|row| {
+                    vec![
+                        mysql_async::Value::Bytes(row.pk.as_bytes().to_vec()),
+                        mysql_async::Value::Bytes(row.op.as_bytes().to_vec()),
+                    ]
+                })
+                .collect();
+            conn.exec_drop(meta_insert, meta_params).await?;
+
+            // --- Bulk data insert (non-tombstone rows only) ---
+            if !columns.is_empty() {
                 let col_names: String = columns
                     .iter()
                     .map(|(name, _)| format!("`{}`", name))
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                let placeholders: String = std::iter::repeat("?")
-                    .take(columns.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                let data_insert = format!(
-                    "INSERT INTO `{}` ({}) VALUES ({})",
-                    data_name, col_names, placeholders
+                let row_placeholder = format!(
+                    "({})",
+                    std::iter::repeat("?")
+                        .take(columns.len())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
 
-                let params: Vec<mysql_async::Value> = row
-                    .values
+                let data_rows: Vec<&TempRow> = rows
                     .iter()
-                    .map(|v| {
-                        if v == "NULL" || v.is_empty() {
-                            mysql_async::Value::NULL
-                        } else {
-                            mysql_async::Value::Bytes(v.as_bytes().to_vec())
-                        }
-                    })
+                    .filter(|row| row.op.to_lowercase() != "delete")
                     .collect();
 
-                conn.exec_drop(data_insert, params).await?;
+                if !data_rows.is_empty() {
+                    let all_placeholders = std::iter::repeat(row_placeholder.as_str())
+                        .take(data_rows.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let data_insert = format!(
+                        "INSERT INTO `{}` ({}) VALUES {}",
+                        data_name, col_names, all_placeholders
+                    );
+                    let data_params: Vec<mysql_async::Value> = data_rows
+                        .iter()
+                        .flat_map(|row| {
+                            row.values.iter().map(|v| {
+                                if v == "NULL" || v.is_empty() {
+                                    mysql_async::Value::NULL
+                                } else {
+                                    mysql_async::Value::Bytes(v.as_bytes().to_vec())
+                                }
+                            })
+                        })
+                        .collect();
+                    conn.exec_drop(data_insert, data_params).await?;
+                }
             }
         }
 

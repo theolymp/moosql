@@ -638,7 +638,7 @@ pub fn execute_delete_sql(
 }
 
 /// Extract the last simple identifier from an ObjectName.
-fn object_name_to_table(name: &ObjectName) -> anyhow::Result<String> {
+pub fn object_name_to_table(name: &ObjectName) -> anyhow::Result<String> {
     let last = name
         .0
         .last()
