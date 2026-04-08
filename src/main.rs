@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod bridge;
 mod cli;
 mod config;
