@@ -113,7 +113,8 @@ async fn seed_database(db_name: &str) -> mysql_async::Pool {
     // Connect without a specific database to create it.
     let admin_url = format!("mysql://root:testpass@127.0.0.1:{}", UPSTREAM_PORT);
     let mut admin = mysql_async::Conn::from_url(&admin_url).await.expect("admin connect failed");
-    admin.query_drop(format!("CREATE DATABASE IF NOT EXISTS `{db_name}`")).await.expect("CREATE DATABASE failed");
+    admin.query_drop(format!("DROP DATABASE IF EXISTS `{db_name}`")).await.expect("DROP DATABASE failed");
+    admin.query_drop(format!("CREATE DATABASE `{db_name}`")).await.expect("CREATE DATABASE failed");
     drop(admin);
 
     let pool = mysql_async::Pool::new(upstream_url_with_db(db_name).as_str());
