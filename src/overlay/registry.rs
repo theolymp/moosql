@@ -199,4 +199,29 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].table_name, "users");
     }
+
+    #[test]
+    fn test_truncated_visible_after_reopen() {
+        let dir = TempDir::new().unwrap();
+
+        // Connection 1: TRUNCATE
+        {
+            let store = OverlayStore::open(dir.path(), "test").unwrap();
+            store.conn.execute(
+                "INSERT INTO _cow_tables (table_name, has_data, truncated) VALUES ('users', 1, 1)
+                 ON CONFLICT(table_name) DO UPDATE SET has_data=1, truncated=1",
+                [],
+            ).unwrap();
+        }
+
+        // Connection 2: read dirty + truncated
+        {
+            let store = OverlayStore::open(dir.path(), "test").unwrap();
+            let reg = Registry::new(&store.conn);
+            let dirty = reg.list_dirty().unwrap();
+            assert_eq!(dirty.len(), 1, "Should find 1 dirty table after reopen");
+            assert_eq!(dirty[0].table_name, "users");
+            assert!(reg.is_truncated("users").unwrap(), "Should be truncated after reopen");
+        }
+    }
 }

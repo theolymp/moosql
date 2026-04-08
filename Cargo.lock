@@ -1157,6 +1157,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "mariadb-cow"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "mysql_async",
+ "opensrv-mysql",
+ "rusqlite",
+ "serde",
+ "sqlparser",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1196,26 +1216,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "moosql"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "mysql_async",
- "opensrv-mysql",
- "rusqlite",
- "serde",
- "sqlparser",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
