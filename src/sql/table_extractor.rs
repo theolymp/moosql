@@ -10,7 +10,7 @@ pub fn extract_tables(sql: &str) -> anyhow::Result<Vec<String>> {
     let dialect = MySqlDialect {};
     let stmts = Parser::parse_sql(&dialect, sql)?;
     let mut tables = Vec::new();
-    visit_relations(&stmts, |relation| {
+    let _ = visit_relations(&stmts, |relation| {
         let name = relation
             .0
             .last()
@@ -28,7 +28,7 @@ pub fn extract_tables(sql: &str) -> anyhow::Result<Vec<String>> {
 /// Extract table names from an already-parsed statement.
 pub fn extract_tables_from_stmt(stmt: &Statement) -> Vec<String> {
     let mut tables = Vec::new();
-    visit_relations(stmt, |relation| {
+    let _ = visit_relations(stmt, |relation| {
         let name = relation
             .0
             .last()
