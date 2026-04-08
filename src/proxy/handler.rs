@@ -430,7 +430,7 @@ impl CowHandler {
 
                 rows.iter()
                     .filter_map(|row| {
-                        row.as_ref(0).map(|v| mysql_value_to_string(v))
+                        row.as_ref(0).map(mysql_value_to_string)
                     })
                     .collect()
             } else {
@@ -565,7 +565,7 @@ impl CowHandler {
                             .map(|(i, (col_name, _))| {
                                 let val = row
                                     .as_ref(i)
-                                    .map(|v| mysql_value_to_string(v))
+                                    .map(mysql_value_to_string)
                                     .unwrap_or_else(|| "NULL".to_string());
                                 (col_name.clone(), val)
                             })
@@ -1219,7 +1219,7 @@ impl CowHandler {
             rows.iter().map(|row| {
                 schema.iter().enumerate().map(|(i, (col_name, _))| {
                     let val = row.as_ref(i)
-                        .map(|v| mysql_value_to_string(v))
+                        .map(mysql_value_to_string)
                         .unwrap_or_else(|| "NULL".to_string());
                     (col_name.clone(), val)
                 }).collect()
@@ -1295,7 +1295,7 @@ impl CowHandler {
             };
 
             rows.iter().filter_map(|row| {
-                row.as_ref(0).map(|v| mysql_value_to_string(v))
+                row.as_ref(0).map(mysql_value_to_string)
             }).collect()
         } else {
             return Ok(None);
@@ -1346,7 +1346,7 @@ impl CowHandler {
                                 Ok(rows) => rows.iter().map(|row| {
                                     child_schema_pairs.iter().enumerate().map(|(i, (col_name, _))| {
                                         let val = row.as_ref(i)
-                                            .map(|v| mysql_value_to_string(v))
+                                            .map(mysql_value_to_string)
                                             .unwrap_or_else(|| "NULL".to_string());
                                         (col_name.clone(), val)
                                     }).collect()
@@ -2096,7 +2096,7 @@ async fn write_result_rows<W: AsyncWrite + Unpin + Send>(
     let mut row_writer = results.start(opensrv_cols).await?;
     for row in rows {
         for i in 0..num_cols {
-            let val: Option<Vec<u8>> = row.as_ref(i).and_then(|v| mysql_value_to_bytes(v));
+            let val: Option<Vec<u8>> = row.as_ref(i).and_then(mysql_value_to_bytes);
             row_writer.write_col(val)?;
         }
         row_writer.end_row().await?;
@@ -2137,7 +2137,7 @@ fn mysql_col_type_to_opensrv(ct: mysql_async::consts::ColumnType) -> ColumnType 
 /// Convert mysql_async ColumnFlags to opensrv-mysql ColumnFlags.
 fn mysql_flags_to_opensrv(flags: mysql_async::consts::ColumnFlags) -> ColumnFlags {
     // Both use the same bitflags values from the MySQL protocol.
-    ColumnFlags::from_bits_truncate(flags.bits() as u16)
+    ColumnFlags::from_bits_truncate(flags.bits())
 }
 
 /// Returns true if the mysql_async error indicates a dropped or broken connection

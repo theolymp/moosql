@@ -85,8 +85,7 @@ impl TempTableManager {
 
         if !rows.is_empty() {
             // --- Bulk meta insert ---
-            let meta_placeholders = std::iter::repeat("(?, ?)")
-                .take(rows.len())
+            let meta_placeholders = std::iter::repeat_n("(?, ?)", rows.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let meta_insert = format!(
@@ -114,8 +113,7 @@ impl TempTableManager {
 
                 let row_placeholder = format!(
                     "({})",
-                    std::iter::repeat("?")
-                        .take(columns.len())
+                    std::iter::repeat_n("?", columns.len())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
@@ -126,8 +124,7 @@ impl TempTableManager {
                     .collect();
 
                 if !data_rows.is_empty() {
-                    let all_placeholders = std::iter::repeat(row_placeholder.as_str())
-                        .take(data_rows.len())
+                    let all_placeholders = std::iter::repeat_n(row_placeholder.as_str(), data_rows.len())
                         .collect::<Vec<_>>()
                         .join(", ");
                     let data_insert = format!(

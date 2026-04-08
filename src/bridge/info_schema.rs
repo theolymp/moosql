@@ -1,9 +1,9 @@
-/// INFORMATION_SCHEMA query detection and overlay patching structures.
-///
-/// When the overlay adds columns via ALTER TABLE or creates new tables,
-/// queries against INFORMATION_SCHEMA should reflect these changes.
-/// This module detects such queries and provides data structures for patching.
-/// The actual result-set patching happens in the wire protocol layer (Task 12).
+// INFORMATION_SCHEMA query detection and overlay patching structures.
+//
+// When the overlay adds columns via ALTER TABLE or creates new tables,
+// queries against INFORMATION_SCHEMA should reflect these changes.
+// This module detects such queries and provides data structures for patching.
+// The actual result-set patching happens in the wire protocol layer (Task 12).
 
 /// Detects whether a SQL query references INFORMATION_SCHEMA.
 ///
