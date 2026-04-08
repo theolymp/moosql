@@ -1,8 +1,17 @@
 use std::collections::HashMap;
 
 use sqlparser::ast::{Query, Select, SetExpr, Statement, TableFactor};
-use sqlparser::dialect::MySqlDialect;
-use sqlparser::parser::Parser;
+
+use super::parser::parse_single_statement;
+
+/// Bundles the parameters that every rewriter helper needs, eliminating
+/// per-function parameter sprawl.
+pub struct RewriteContext<'a> {
+    pub dirty_tables: &'a [&'a str],
+    pub temp_prefix: &'a str,
+    pub pk_columns: &'a HashMap<String, String>,
+    pub truncated_tables: &'a [&'a str],
+}
 
 /// Rewrite a SELECT statement so that every dirty table reference becomes a
 /// UNION-based derived subquery merging base rows with overlay rows.
@@ -25,45 +34,36 @@ pub fn rewrite_select(
         return Ok(sql.to_string());
     }
 
-    let dialect = MySqlDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql)?;
+    let ctx = RewriteContext {
+        dirty_tables,
+        temp_prefix,
+        pk_columns,
+        truncated_tables,
+    };
 
-    if stmts.is_empty() {
-        return Ok(sql.to_string());
-    }
-
-    let stmt = stmts.remove(0);
-    let rewritten = rewrite_statement(stmt, dirty_tables, temp_prefix, pk_columns, truncated_tables)?;
+    let stmt = match parse_single_statement(sql) {
+        Ok(s) => s,
+        Err(_) => return Ok(sql.to_string()),
+    };
+    let rewritten = rewrite_statement(stmt, &ctx)?;
 
     Ok(rewritten.to_string())
 }
 
-fn rewrite_statement(
-    stmt: Statement,
-    dirty_tables: &[&str],
-    temp_prefix: &str,
-    pk_columns: &HashMap<String, String>,
-    truncated_tables: &[&str],
-) -> anyhow::Result<Statement> {
+fn rewrite_statement(stmt: Statement, ctx: &RewriteContext<'_>) -> anyhow::Result<Statement> {
     match stmt {
         Statement::Query(query) => {
-            let rewritten = rewrite_query(*query, dirty_tables, temp_prefix, pk_columns, truncated_tables)?;
+            let rewritten = rewrite_query(*query, ctx)?;
             Ok(Statement::Query(Box::new(rewritten)))
         }
         other => Ok(other),
     }
 }
 
-fn rewrite_query(
-    mut query: Query,
-    dirty_tables: &[&str],
-    temp_prefix: &str,
-    pk_columns: &HashMap<String, String>,
-    truncated_tables: &[&str],
-) -> anyhow::Result<Query> {
+fn rewrite_query(mut query: Query, ctx: &RewriteContext<'_>) -> anyhow::Result<Query> {
     match *query.body {
         SetExpr::Select(mut select) => {
-            rewrite_select_from(&mut select, dirty_tables, temp_prefix, pk_columns, truncated_tables)?;
+            rewrite_select_from(&mut select, ctx)?;
             query.body = Box::new(SetExpr::Select(select));
             Ok(query)
         }
@@ -86,10 +86,7 @@ fn rewrite_query(
                     format_clause: None,
                     pipe_operators: vec![],
                 },
-                dirty_tables,
-                temp_prefix,
-                pk_columns,
-                truncated_tables,
+                ctx,
             )?;
             let right = rewrite_query(
                 Query {
@@ -104,10 +101,7 @@ fn rewrite_query(
                     format_clause: None,
                     pipe_operators: vec![],
                 },
-                dirty_tables,
-                temp_prefix,
-                pk_columns,
-                truncated_tables,
+                ctx,
             )?;
             query.body = Box::new(SetExpr::SetOperation {
                 op,
@@ -124,32 +118,15 @@ fn rewrite_query(
     }
 }
 
-fn rewrite_select_from(
-    select: &mut Select,
-    dirty_tables: &[&str],
-    temp_prefix: &str,
-    pk_columns: &HashMap<String, String>,
-    truncated_tables: &[&str],
-) -> anyhow::Result<()> {
+fn rewrite_select_from(select: &mut Select, ctx: &RewriteContext<'_>) -> anyhow::Result<()> {
     for table_with_joins in &mut select.from {
         // Rewrite the primary relation.
-        table_with_joins.relation = rewrite_table_factor(
-            table_with_joins.relation.clone(),
-            dirty_tables,
-            temp_prefix,
-            pk_columns,
-            truncated_tables,
-        )?;
+        table_with_joins.relation =
+            rewrite_table_factor(table_with_joins.relation.clone(), ctx)?;
 
         // Rewrite each joined relation.
         for join in &mut table_with_joins.joins {
-            join.relation = rewrite_table_factor(
-                join.relation.clone(),
-                dirty_tables,
-                temp_prefix,
-                pk_columns,
-                truncated_tables,
-            )?;
+            join.relation = rewrite_table_factor(join.relation.clone(), ctx)?;
         }
     }
     Ok(())
@@ -165,10 +142,7 @@ fn rewrite_select_from(
 /// are also rewritten.
 fn rewrite_table_factor(
     factor: TableFactor,
-    dirty_tables: &[&str],
-    temp_prefix: &str,
-    pk_columns: &HashMap<String, String>,
-    truncated_tables: &[&str],
+    ctx: &RewriteContext<'_>,
 ) -> anyhow::Result<TableFactor> {
     match factor {
         TableFactor::Table {
@@ -184,7 +158,7 @@ fn rewrite_table_factor(
                 .map(|i| i.value.clone())
                 .unwrap_or_else(|| name.to_string());
 
-            if !dirty_tables.contains(&table_name.as_str()) {
+            if !ctx.dirty_tables.contains(&table_name.as_str()) {
                 return Ok(factor);
             }
 
@@ -194,10 +168,10 @@ fn rewrite_table_factor(
                 .map(|a| a.name.value.clone())
                 .unwrap_or_else(|| table_name.clone());
 
-            let temp_table = format!("{}{}", temp_prefix, table_name);
+            let temp_table = format!("{}{}", ctx.temp_prefix, table_name);
 
             // If the table was TRUNCATEd, return only overlay rows — skip the base.
-            let query_sql = if truncated_tables.contains(&table_name.as_str()) {
+            let query_sql = if ctx.truncated_tables.contains(&table_name.as_str()) {
                 format!(
                     "SELECT * FROM (SELECT * FROM {temp}) AS {alias}",
                     temp = temp_table,
@@ -207,7 +181,8 @@ fn rewrite_table_factor(
                 let meta_table = format!("_cow_meta_{}", table_name);
 
                 // Look up the PK column for this table; fall back to "id" if unknown.
-                let pk_col = pk_columns
+                let pk_col = ctx
+                    .pk_columns
                     .get(&table_name)
                     .map(|s| s.as_str())
                     .unwrap_or("id");
@@ -232,11 +207,8 @@ fn rewrite_table_factor(
                 )
             };
 
-            let dialect = MySqlDialect {};
-            let mut stmts = Parser::parse_sql(&dialect, &query_sql)
+            let outer_stmt = parse_single_statement(&query_sql)
                 .map_err(|e| anyhow::anyhow!("Failed to parse generated SQL: {e}"))?;
-
-            let outer_stmt = stmts.remove(0);
 
             // Unwrap: SELECT * FROM (<subquery>) AS alias  — we want the FROM factor.
             if let Statement::Query(outer_query) = outer_stmt {
@@ -257,7 +229,7 @@ fn rewrite_table_factor(
             sample,
         } => {
             // Recurse into derived subqueries.
-            let rewritten = rewrite_query(*subquery, dirty_tables, temp_prefix, pk_columns, truncated_tables)?;
+            let rewritten = rewrite_query(*subquery, ctx)?;
             Ok(TableFactor::Derived {
                 lateral,
                 subquery: Box::new(rewritten),

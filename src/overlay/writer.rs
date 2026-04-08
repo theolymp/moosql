@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context};
 use sqlparser::ast::{AssignmentTarget, Expr, FromTable, ObjectName, SetExpr, Statement, TableObject, Value};
-use sqlparser::dialect::MySqlDialect;
-use sqlparser::parser::Parser;
+
+use crate::sql::parser::parse_single_statement;
 
 use crate::overlay::registry::{DirtyKind, Registry};
 use crate::overlay::row_store::RowStore;
@@ -277,13 +277,7 @@ pub fn execute_insert_sql_with_defaults(
     schema: &[(String, String)],
     defaults: &HashMap<String, String>,
 ) -> anyhow::Result<WriteResult> {
-    let dialect = MySqlDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| anyhow!("Failed to parse SQL: {e}"))?;
-    if stmts.is_empty() {
-        bail!("Empty SQL statement");
-    }
-    let stmt = stmts.remove(0);
+    let stmt = parse_single_statement(sql).map_err(|e| anyhow!("Failed to parse SQL: {e}"))?;
     execute_insert(store, &stmt, schema, defaults)
 }
 
@@ -392,7 +386,51 @@ pub fn execute_update(
         })
         .collect();
 
-    for upstream_row in upstream_rows {
+    let shadow = format!("_cow_data_{table_name}");
+
+    // --- Batch shadow lookup ---
+    // Compute the PK string for every upstream row first, then fetch all existing
+    // overlay ops in a single IN query instead of one SELECT per row.
+    let row_pks: Vec<String> = upstream_rows
+        .iter()
+        .map(|upstream_row| {
+            if let Some(pk) = pk_col {
+                upstream_row
+                    .iter()
+                    .find(|(c, _)| c.eq_ignore_ascii_case(pk))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| "unknown".to_string())
+            } else {
+                "unknown".to_string()
+            }
+        })
+        .collect();
+
+    // Fetch existing ops for all PKs in one query.
+    let existing_ops: HashMap<String, String> = if !row_pks.is_empty() {
+        let placeholders: Vec<String> = (1..=row_pks.len()).map(|i| format!("?{i}")).collect();
+        let batch_sql = format!(
+            "SELECT _cow_pk, _cow_op FROM \"{}\" WHERE _cow_pk IN ({})",
+            shadow,
+            placeholders.join(", ")
+        );
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            row_pks.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+        let mut stmt_prepared = store.conn.prepare(&batch_sql)
+            .with_context(|| format!("Failed to prepare batch shadow lookup for {shadow}"))?;
+        let rows_iter = stmt_prepared
+            .query_map(param_refs.as_slice(), |row| {
+                let pk: String = row.get(0)?;
+                let op: String = row.get(1)?;
+                Ok((pk, op))
+            })
+            .with_context(|| format!("Failed to execute batch shadow lookup for {shadow}"))?;
+        rows_iter.filter_map(|r| r.ok()).collect()
+    } else {
+        HashMap::new()
+    };
+
+    for (upstream_row, cow_pk) in upstream_rows.iter().zip(row_pks.iter()) {
         // Build a mutable map from the upstream row
         let mut col_val_map: Vec<(String, String)> = upstream_row.clone();
 
@@ -409,33 +447,13 @@ pub fn execute_update(
             }
         }
 
-        // Determine PK value
-        let cow_pk = if let Some(pk) = pk_col {
-            col_val_map
-                .iter()
-                .find(|(c, _)| c.eq_ignore_ascii_case(pk))
-                .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| "unknown".to_string())
-        } else {
-            "unknown".to_string()
-        };
-
-        // Check if this row already exists in the overlay
-        let shadow = format!("_cow_data_{table_name}");
-        let existing_op: Option<String> = store
-            .conn
-            .query_row(
-                &format!("SELECT _cow_op FROM \"{}\" WHERE _cow_pk = ?1", shadow),
-                rusqlite::params![&cow_pk],
-                |row| row.get(0),
-            )
-            .ok();
+        let existing_op = existing_ops.get(cow_pk);
 
         if existing_op.is_some() {
             // Row already in overlay — update it in place
             // Keep the original _cow_op if it was INSERT (overlay-only row),
             // otherwise set to UPDATE
-            let new_op = match existing_op.as_deref() {
+            let new_op = match existing_op.map(|s| s.as_str()) {
                 Some("INSERT") => "INSERT",
                 _ => "UPDATE",
             };
@@ -455,7 +473,7 @@ pub fn execute_update(
                 set_clauses.join(", "),
                 params.len() + 1,
             );
-            params.push(cow_pk);
+            params.push(cow_pk.clone());
 
             let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
                 .iter()
@@ -469,7 +487,7 @@ pub fn execute_update(
         } else {
             // New overlay row — insert with UPDATE op
             let mut sql_cols = vec!["_cow_pk".to_string(), "_cow_op".to_string()];
-            let mut sql_vals: Vec<String> = vec![cow_pk, "UPDATE".to_string()];
+            let mut sql_vals: Vec<String> = vec![cow_pk.clone(), "UPDATE".to_string()];
 
             for (col, val) in &col_val_map {
                 sql_cols.push(format!("\"{}\"", col));
@@ -517,13 +535,7 @@ pub fn execute_update_sql(
     schema: &[(String, String)],
     upstream_rows: &[Vec<(String, String)>],
 ) -> anyhow::Result<WriteResult> {
-    let dialect = MySqlDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| anyhow!("Failed to parse SQL: {e}"))?;
-    if stmts.is_empty() {
-        bail!("Empty SQL statement");
-    }
-    let stmt = stmts.remove(0);
+    let stmt = parse_single_statement(sql).map_err(|e| anyhow!("Failed to parse SQL: {e}"))?;
     execute_update(store, &stmt, schema, upstream_rows)
 }
 
@@ -554,18 +566,36 @@ pub fn execute_delete(
     let shadow = format!("_cow_data_{table_name}");
     let mut affected_rows: u64 = 0;
 
-    for pk in upstream_pks {
-        // Check if this row exists in the overlay
-        let existing_op: Option<String> = store
-            .conn
-            .query_row(
-                &format!("SELECT _cow_op FROM \"{}\" WHERE _cow_pk = ?1", shadow),
-                rusqlite::params![pk],
-                |row| row.get(0),
-            )
-            .ok();
+    // --- Batch shadow lookup ---
+    // Fetch existing ops for all PKs in one IN query instead of one SELECT per PK.
+    let existing_ops: HashMap<String, String> = if !upstream_pks.is_empty() {
+        let placeholders: Vec<String> =
+            (1..=upstream_pks.len()).map(|i| format!("?{i}")).collect();
+        let batch_sql = format!(
+            "SELECT _cow_pk, _cow_op FROM \"{}\" WHERE _cow_pk IN ({})",
+            shadow,
+            placeholders.join(", ")
+        );
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            upstream_pks.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect();
+        let mut stmt_prepared = store.conn.prepare(&batch_sql)
+            .with_context(|| format!("Failed to prepare batch shadow lookup for {shadow}"))?;
+        let rows_iter = stmt_prepared
+            .query_map(param_refs.as_slice(), |row| {
+                let pk: String = row.get(0)?;
+                let op: String = row.get(1)?;
+                Ok((pk, op))
+            })
+            .with_context(|| format!("Failed to execute batch shadow lookup for {shadow}"))?;
+        rows_iter.filter_map(|r| r.ok()).collect()
+    } else {
+        HashMap::new()
+    };
 
-        match existing_op.as_deref() {
+    for pk in upstream_pks {
+        let existing_op = existing_ops.get(pk).map(|s| s.as_str());
+
+        match existing_op {
             Some("INSERT") => {
                 // Overlay-only row — just delete it, no tombstone needed
                 store
@@ -627,13 +657,7 @@ pub fn execute_delete_sql(
     schema: &[(String, String)],
     upstream_pks: &[String],
 ) -> anyhow::Result<WriteResult> {
-    let dialect = MySqlDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| anyhow!("Failed to parse SQL: {e}"))?;
-    if stmts.is_empty() {
-        bail!("Empty SQL statement");
-    }
-    let stmt = stmts.remove(0);
+    let stmt = parse_single_statement(sql).map_err(|e| anyhow!("Failed to parse SQL: {e}"))?;
     execute_delete(store, &stmt, schema, upstream_pks)
 }
 
@@ -778,13 +802,7 @@ pub fn execute_ddl(
 
 /// Convenience function: parse SQL and execute a DDL statement against the overlay.
 pub fn execute_ddl_sql(store: &OverlayStore, sql: &str) -> anyhow::Result<WriteResult> {
-    let dialect = MySqlDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| anyhow!("Failed to parse DDL SQL: {e}"))?;
-    if stmts.is_empty() {
-        bail!("Empty SQL statement");
-    }
-    let stmt = stmts.remove(0);
+    let stmt = parse_single_statement(sql).map_err(|e| anyhow!("Failed to parse DDL SQL: {e}"))?;
     execute_ddl(store, sql, &stmt)
 }
 

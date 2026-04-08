@@ -22,6 +22,14 @@ pub enum QueryKind {
     Unparseable(String),
 }
 
+/// Parse `sql` and return the first (and expected only) statement.
+/// Returns an error if the SQL cannot be parsed or yields no statements.
+pub fn parse_single_statement(sql: &str) -> anyhow::Result<Statement> {
+    let dialect = MySqlDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, sql)?;
+    stmts.into_iter().next().ok_or_else(|| anyhow::anyhow!("Empty SQL"))
+}
+
 pub fn parse_query(sql: &str) -> anyhow::Result<QueryKind> {
     let dialect = MySqlDialect {};
     let result = Parser::parse_sql(&dialect, sql);

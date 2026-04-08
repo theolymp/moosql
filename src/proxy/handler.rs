@@ -92,6 +92,9 @@ pub struct CowHandler {
     /// Whether the dirty_tables cache needs a re-read from SQLite.
     /// Set to true initially and after any overlay write; cleared after refresh.
     dirty_tables_stale: bool,
+    /// Cached PK column map (table_name -> pk_column_name), rebuilt whenever
+    /// dirty_tables is refreshed. Avoids recomputing on every query.
+    pk_columns_cache: HashMap<String, String>,
 }
 
 impl CowHandler {
@@ -117,6 +120,7 @@ impl CowHandler {
             last_insert_id: None,
             schema_cache: SchemaCache::new(),
             dirty_tables_stale: true,
+            pk_columns_cache: HashMap::new(),
         }
     }
 
@@ -188,11 +192,14 @@ impl CowHandler {
                             self.dirty_tables = table_names;
                             self.truncated_tables = truncated;
                             self.dirty_tables_stale = false;
+                            // Rebuild pk_columns_cache now that dirty_tables is fresh.
+                            self.pk_columns_cache = self.compute_pk_columns();
                         }
                         Err(e) => {
                             warn!("Failed to list dirty tables: {}", e);
                             self.dirty_tables.clear();
                             self.truncated_tables.clear();
+                            self.pk_columns_cache.clear();
                         }
                     }
                 }
@@ -200,12 +207,14 @@ impl CowHandler {
                     debug!("No overlay store for db {}: {}", db, e);
                     self.dirty_tables.clear();
                     self.truncated_tables.clear();
+                    self.pk_columns_cache.clear();
                     self.dirty_tables_stale = false;
                 }
             }
         } else {
             self.dirty_tables.clear();
             self.truncated_tables.clear();
+            self.pk_columns_cache.clear();
             self.dirty_tables_stale = false;
         }
     }
@@ -879,25 +888,22 @@ impl CowHandler {
             let temp_rows: Vec<crate::bridge::temp_tables::TempRow> = overlay_data
                 .iter()
                 .map(|pairs| {
-                    let pk = pairs
+                    // Build a HashMap once per row to avoid O(cols) linear scans per column.
+                    let pair_map: HashMap<&str, &str> = pairs
                         .iter()
-                        .find(|(k, _)| k == "_cow_pk")
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_default();
-                    let op = pairs
-                        .iter()
-                        .find(|(k, _)| k == "_cow_op")
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_default();
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
+
+                    let pk = pair_map.get("_cow_pk").map(|v| v.to_string()).unwrap_or_default();
+                    let op = pair_map.get("_cow_op").map(|v| v.to_string()).unwrap_or_default();
 
                     // Values in schema column order.
                     let values: Vec<String> = col_defs
                         .iter()
                         .map(|(col_name, _)| {
-                            pairs
-                                .iter()
-                                .find(|(k, _)| k == col_name)
-                                .map(|(_, v)| v.clone())
+                            pair_map
+                                .get(col_name.as_str())
+                                .map(|v| v.to_string())
                                 .unwrap_or_else(|| "NULL".to_string())
                         })
                         .collect();
@@ -1902,10 +1908,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
         // Refresh dirty tables on each query (could be optimized later)
         self.refresh_dirty_tables();
 
-        // Compute PK column map so the rewriter uses the correct column per table.
-        let pk_columns = self.compute_pk_columns();
-
-        // Route the query
+        // Route the query — use cached pk_columns (rebuilt inside refresh_dirty_tables).
         if !self.truncated_tables.is_empty() {
             info!(
                 conn_id = self.conn_id,
@@ -1913,7 +1916,8 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                 "Routing with truncated tables"
             );
         }
-        let action = query_handler::route_query(query, &self.dirty_tables, &pk_columns, &self.truncated_tables);
+        let pk_columns_snapshot = self.pk_columns_cache.clone();
+        let action = query_handler::route_query(query, &self.dirty_tables, &pk_columns_snapshot, &self.truncated_tables);
 
         match action {
             QueryAction::Passthrough(sql) => {
@@ -2041,7 +2045,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                         let dirty_refs: Vec<&str> = self.dirty_tables.iter().map(|s| s.as_str()).collect();
                         let truncated_refs: Vec<&str> = self.truncated_tables.iter().map(|s| s.as_str()).collect();
                         match crate::sql::sp_rewriter::rewrite_sp_from_definition_statements(
-                            &create_sql, &dirty_refs, "_cow_temp_", &pk_columns, &truncated_refs,
+                            &create_sql, &dirty_refs, "_cow_temp_", &pk_columns_snapshot, &truncated_refs,
                         ) {
                             Ok(stmts) if !stmts.is_empty() => {
                                 debug!(conn_id = self.conn_id, stmt_count = stmts.len(), "Executing rewritten SP statements");
