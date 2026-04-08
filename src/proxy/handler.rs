@@ -1072,8 +1072,8 @@ impl CowHandler {
         };
 
         // Detect INSERT ... SELECT: fall through to passthrough (TODO).
-        if let sqlparser::ast::Statement::Insert(insert) = stmt {
-            if let Some(source) = &insert.source {
+        if let sqlparser::ast::Statement::Insert(insert) = stmt
+            && let Some(source) = &insert.source {
                 let is_values = matches!(
                     source.body.as_ref(),
                     sqlparser::ast::SetExpr::Values(_)
@@ -1087,11 +1087,10 @@ impl CowHandler {
                     return Ok(None);
                 }
             }
-        }
 
         // Detect INSERT ... ON DUPLICATE KEY UPDATE: fall through (TODO).
-        if let sqlparser::ast::Statement::Insert(insert) = stmt {
-            if let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_)) = &insert.on {
+        if let sqlparser::ast::Statement::Insert(insert) = stmt
+            && let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_)) = &insert.on {
                 warn!(
                     conn_id = self.conn_id,
                     table = %table_name,
@@ -1099,7 +1098,6 @@ impl CowHandler {
                 );
                 return Ok(None);
             }
-        }
 
         // Fetch (or retrieve from cache) schema + defaults.
         let cached_schema = match self.get_or_fetch_schema(&table_name).await {

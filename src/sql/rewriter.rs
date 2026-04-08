@@ -211,13 +211,12 @@ fn rewrite_table_factor(
                 .map_err(|e| anyhow::anyhow!("Failed to parse generated SQL: {e}"))?;
 
             // Unwrap: SELECT * FROM (<subquery>) AS alias  — we want the FROM factor.
-            if let Statement::Query(outer_query) = outer_stmt {
-                if let SetExpr::Select(outer_select) = *outer_query.body {
+            if let Statement::Query(outer_query) = outer_stmt
+                && let SetExpr::Select(outer_select) = *outer_query.body {
                     if let Some(first_from) = outer_select.from.into_iter().next() {
                         return Ok(first_from.relation);
                     }
                 }
-            }
 
             anyhow::bail!("Unexpected AST shape when building subquery for {table_name}");
         }

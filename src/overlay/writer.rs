@@ -173,11 +173,10 @@ pub fn execute_insert(
 
         // Fill in missing columns from defaults
         for (col_name, col_type) in schema {
-            if !col_val_map.iter().any(|(c, _)| c.eq_ignore_ascii_case(col_name)) {
-                if let Some(default_val) = defaults.get(col_name) {
+            if !col_val_map.iter().any(|(c, _)| c.eq_ignore_ascii_case(col_name))
+                && let Some(default_val) = defaults.get(col_name) {
                     col_val_map.push((col_name.as_str(), default_val.clone()));
                 }
-            }
             // Suppress unused variable warning for col_type
             let _ = col_type;
         }
