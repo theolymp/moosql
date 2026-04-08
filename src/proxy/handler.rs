@@ -83,8 +83,6 @@ pub struct CowHandler {
     dirty_tables: Vec<String>,
     /// Cached list of truncated table names (subset of dirty_tables, refreshed alongside).
     truncated_tables: Vec<String>,
-    /// Cached map of table name -> primary-key column name (refreshed alongside dirty_tables).
-    pk_columns: HashMap<String, String>,
     /// Upstream prepared statements keyed by the statement ID sent to the client.
     prepared_stmts: HashMap<u32, MysqlStatement>,
     /// Last insert ID produced by an overlay INSERT (returned for SELECT LAST_INSERT_ID()).
@@ -115,7 +113,6 @@ impl CowHandler {
             conn_id: CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
             dirty_tables: Vec::new(),
             truncated_tables: Vec::new(),
-            pk_columns: HashMap::new(),
             prepared_stmts: HashMap::new(),
             last_insert_id: None,
             schema_cache: SchemaCache::new(),
@@ -213,27 +210,22 @@ impl CowHandler {
         }
     }
 
-    /// Refresh the pk_columns map for all currently-dirty tables.
+    /// Compute the pk_columns map for all currently-dirty tables from the schema cache.
     ///
-    /// Reads from the schema cache (populated lazily by `get_or_fetch_schema`).
-    /// Tables not yet in the cache are skipped here; they will be fetched on demand
+    /// Tables not yet in the cache are skipped; they will be fetched on demand
     /// when the first write against them arrives.
-    fn refresh_pk_columns(&mut self) {
-        let dirty = self.dirty_tables.clone();
-        let mut map = HashMap::new();
-        for table in &dirty {
-            if let Some(cached) = self.schema_cache.get(table) {
-                let pk = cached.pk_column();
-                // Only store if the schema actually has a PK column; otherwise let
-                // the rewriter fall back to "id".
-                if cached.columns.iter().any(|c| c.is_pk) {
-                    map.insert(table.clone(), pk);
-                }
-            }
-            // If not cached yet, skip — the cache will be populated on the first
-            // write, and refresh_pk_columns is called again at the start of each query.
-        }
-        self.pk_columns = map;
+    fn compute_pk_columns(&self) -> HashMap<String, String> {
+        self.dirty_tables.iter()
+            .filter_map(|t| {
+                self.schema_cache.get(t).and_then(|cached| {
+                    if cached.columns.iter().any(|c| c.is_pk) {
+                        Some((t.clone(), cached.pk_column()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect()
     }
 
     /// Return the cached schema for `table`, fetching it from upstream via a single
@@ -989,18 +981,7 @@ impl CowHandler {
 
                 match columns_arc {
                     Some(cols) if !cols.is_empty() => {
-                        // Build column definitions for opensrv-mysql
-                        let opensrv_cols: Vec<Column> = cols
-                            .iter()
-                            .map(|c| Column {
-                                table: c.table_str().to_string(),
-                                column: c.name_str().to_string(),
-                                coltype: mysql_col_type_to_opensrv(c.column_type()),
-                                colflags: mysql_flags_to_opensrv(c.flags()),
-                            })
-                            .collect();
-
-                        let num_cols = opensrv_cols.len();
+                        let opensrv_cols = build_opensrv_columns(&cols);
 
                         // Collect all rows
                         let rows: Vec<Row> = result.collect().await.map_err(|e| {
@@ -1013,20 +994,7 @@ impl CowHandler {
                         // Drop the result to release the connection
                         drop(result);
 
-                        // Start writing result set
-                        let mut row_writer = results.start(&opensrv_cols).await?;
-
-                        for row in &rows {
-                            for i in 0..num_cols {
-                                let val: Option<Vec<u8>> = row
-                                    .as_ref(i)
-                                    .and_then(|v| mysql_value_to_bytes(v));
-                                row_writer.write_col(val)?;
-                            }
-                            row_writer.end_row().await?;
-                        }
-
-                        row_writer.finish().await?;
+                        write_result_rows(&opensrv_cols, &rows, results).await?;
                     }
                     _ => {
                         // No columns = this is an OK result (INSERT/UPDATE/DELETE etc.)
@@ -1053,6 +1021,571 @@ impl CowHandler {
                     .error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes())
                     .await?;
                 Ok(())
+            }
+        }
+    }
+
+    /// Handle an overlay write (INSERT/UPDATE/DELETE/DDL) by re-parsing the SQL,
+    /// extracting the table name, fetching schemas, and dispatching to the
+    /// appropriate overlay writer function.
+    ///
+    /// Returns `Ok(Some((write_result, table_name)))` on success,
+    /// `Ok(None)` for unhandled query types, or `Err(message)` for FK violations.
+    async fn handle_overlay_write(
+        &mut self,
+        sql: &str,
+    ) -> Result<Option<(crate::overlay::writer::WriteResult, String)>, String> {
+        // Re-parse the SQL to get the AST
+        let parsed = match crate::sql::parser::parse_query(sql) {
+            Ok(kind) => kind,
+            Err(e) => {
+                warn!(conn_id = self.conn_id, error = %e, "Failed to re-parse overlay SQL");
+                return Ok(None);
+            }
+        };
+
+        use crate::sql::parser::QueryKind;
+
+        match parsed {
+            QueryKind::Insert(stmt) => self.handle_overlay_insert(sql, &stmt).await,
+            QueryKind::Update(stmt) => self.handle_overlay_update(&stmt).await,
+            QueryKind::Delete(stmt) => self.handle_overlay_delete(&stmt).await,
+            QueryKind::Ddl(stmt) => self.handle_overlay_ddl(sql, &stmt).await,
+            _ => Ok(None),
+        }
+    }
+
+    /// Handle an overlay INSERT statement.
+    async fn handle_overlay_insert(
+        &mut self,
+        _sql: &str,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<(crate::overlay::writer::WriteResult, String)>, String> {
+        // Extract table name
+        let table_name = match stmt {
+            sqlparser::ast::Statement::Insert(insert) => {
+                match &insert.table {
+                    sqlparser::ast::TableObject::TableName(name) => {
+                        writer::object_name_to_table(name).ok()
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        let table_name = match table_name {
+            Some(t) => t,
+            None => {
+                warn!(conn_id = self.conn_id, "Could not extract table name from INSERT");
+                return Ok(None);
+            }
+        };
+
+        // Detect INSERT ... SELECT: fall through to passthrough (TODO).
+        if let sqlparser::ast::Statement::Insert(insert) = stmt {
+            if let Some(source) = &insert.source {
+                let is_values = matches!(
+                    source.body.as_ref(),
+                    sqlparser::ast::SetExpr::Values(_)
+                );
+                if !is_values {
+                    warn!(
+                        conn_id = self.conn_id,
+                        table = %table_name,
+                        "INSERT ... SELECT detected — falling through to passthrough (TODO: full overlay support)"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+
+        // Detect INSERT ... ON DUPLICATE KEY UPDATE: fall through (TODO).
+        if let sqlparser::ast::Statement::Insert(insert) = stmt {
+            if let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_)) = &insert.on {
+                warn!(
+                    conn_id = self.conn_id,
+                    table = %table_name,
+                    "INSERT ... ON DUPLICATE KEY UPDATE detected — falling through to passthrough (TODO: full overlay support)"
+                );
+                return Ok(None);
+            }
+        }
+
+        // Fetch (or retrieve from cache) schema + defaults.
+        let cached_schema = match self.get_or_fetch_schema(&table_name).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(conn_id = self.conn_id, error = %e, "Failed to fetch table schema");
+                return Ok(None);
+            }
+        };
+        let schema = cached_schema.schema_pairs();
+        let defaults = cached_schema.defaults();
+
+        let db = match &self.current_db {
+            Some(db) => db.clone(),
+            None => {
+                warn!(conn_id = self.conn_id, "No database selected for overlay write");
+                return Ok(None);
+            }
+        };
+
+        match OverlayStore::open(&self.overlay_dir, &db) {
+            Ok(store) => {
+                match writer::execute_insert(&store, stmt, &schema, &defaults) {
+                    Ok(wr) => Ok(Some((wr, table_name))),
+                    Err(e) => {
+                        warn!(conn_id = self.conn_id, error = %e, "Overlay INSERT failed");
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(conn_id = self.conn_id, error = %e, "Failed to open overlay store");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Extract table name and WHERE clause from an UPDATE statement.
+    fn extract_update_table_info(
+        stmt: &sqlparser::ast::Statement,
+    ) -> (Option<String>, Option<String>) {
+        match stmt {
+            sqlparser::ast::Statement::Update(update) => {
+                let tname = match &update.table.relation {
+                    sqlparser::ast::TableFactor::Table { name, .. } => {
+                        writer::object_name_to_table(name).ok()
+                    }
+                    _ => None,
+                };
+                (tname, update.selection.as_ref().map(|e| e.to_string()))
+            }
+            _ => (None, None),
+        }
+    }
+
+    /// Extract table name and WHERE clause from a DELETE statement.
+    fn extract_delete_table_info(
+        stmt: &sqlparser::ast::Statement,
+    ) -> (Option<String>, Option<String>) {
+        match stmt {
+            sqlparser::ast::Statement::Delete(delete) => {
+                let tables = match &delete.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(t) => t,
+                    sqlparser::ast::FromTable::WithoutKeyword(t) => t,
+                };
+                let tname = tables.first().and_then(|twj| {
+                    match &twj.relation {
+                        sqlparser::ast::TableFactor::Table { name, .. } => {
+                            writer::object_name_to_table(name).ok()
+                        }
+                        _ => None,
+                    }
+                });
+                (tname, delete.selection.as_ref().map(|e| e.to_string()))
+            }
+            _ => (None, None),
+        }
+    }
+
+    /// Handle an overlay UPDATE statement.
+    async fn handle_overlay_update(
+        &mut self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<(crate::overlay::writer::WriteResult, String)>, String> {
+        let (table_name, where_clause) = Self::extract_update_table_info(stmt);
+
+        let table_name = match table_name {
+            Some(t) => t,
+            None => {
+                warn!(conn_id = self.conn_id, "Could not extract table name from UPDATE");
+                return Ok(None);
+            }
+        };
+
+        // Fetch (or retrieve from cache) schema.
+        let schema = match self.get_or_fetch_schema(&table_name).await {
+            Ok(s) => s.schema_pairs(),
+            Err(e) => {
+                warn!(conn_id = self.conn_id, error = %e, "Failed to fetch table schema");
+                return Ok(None);
+            }
+        };
+
+        // Fetch affected rows from upstream: SELECT * FROM <table> WHERE <where>
+        let select_sql = match &where_clause {
+            Some(w) => format!("SELECT * FROM `{}` WHERE {}", table_name, w),
+            None => format!("SELECT * FROM `{}`", table_name),
+        };
+
+        let upstream_rows: Vec<Vec<(String, String)>> = if let Some(ref mut conn) = self.upstream {
+            let rows: Vec<Row> = match conn.query(&select_sql).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(conn_id = self.conn_id, error = %e, "Failed to fetch upstream rows for UPDATE");
+                    return Ok(None);
+                }
+            };
+
+            rows.iter().map(|row| {
+                schema.iter().enumerate().map(|(i, (col_name, _))| {
+                    let val = row.as_ref(i)
+                        .map(|v| mysql_value_to_string(v))
+                        .unwrap_or_else(|| "NULL".to_string());
+                    (col_name.clone(), val)
+                }).collect()
+            }).collect()
+        } else {
+            return Ok(None);
+        };
+
+        let db = match &self.current_db {
+            Some(db) => db.clone(),
+            None => {
+                warn!(conn_id = self.conn_id, "No database selected for overlay write");
+                return Ok(None);
+            }
+        };
+
+        match OverlayStore::open(&self.overlay_dir, &db) {
+            Ok(store) => {
+                match writer::execute_update(&store, stmt, &schema, &upstream_rows) {
+                    Ok(wr) => Ok(Some((wr, table_name))),
+                    Err(e) => {
+                        warn!(conn_id = self.conn_id, error = %e, "Overlay UPDATE failed");
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(conn_id = self.conn_id, error = %e, "Failed to open overlay store");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Handle an overlay DELETE statement, including FK constraint enforcement.
+    async fn handle_overlay_delete(
+        &mut self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<(crate::overlay::writer::WriteResult, String)>, String> {
+        let (table_name, where_clause) = Self::extract_delete_table_info(stmt);
+
+        let table_name = match table_name {
+            Some(t) => t,
+            None => {
+                warn!(conn_id = self.conn_id, "Could not extract table name from DELETE");
+                return Ok(None);
+            }
+        };
+
+        // Fetch (or retrieve from cache) schema.
+        let cached_schema = match self.get_or_fetch_schema(&table_name).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(conn_id = self.conn_id, error = %e, "Failed to fetch table schema");
+                return Ok(None);
+            }
+        };
+        let schema = cached_schema.schema_pairs();
+        let pk_col = cached_schema.pk_column();
+
+        // Fetch affected PKs from upstream.
+        let select_sql = match &where_clause {
+            Some(w) => format!("SELECT `{}` FROM `{}` WHERE {}", pk_col, table_name, w),
+            None => format!("SELECT `{}` FROM `{}`", pk_col, table_name),
+        };
+
+        let upstream_pks: Vec<String> = if let Some(ref mut conn) = self.upstream {
+            let rows: Vec<Row> = match conn.query(&select_sql).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(conn_id = self.conn_id, error = %e, "Failed to fetch upstream PKs for DELETE");
+                    return Ok(None);
+                }
+            };
+
+            rows.iter().filter_map(|row| {
+                row.as_ref(0).map(|v| mysql_value_to_string(v))
+            }).collect()
+        } else {
+            return Ok(None);
+        };
+
+        // Enforce FK constraints before executing delete.
+        let child_fks: Vec<ForeignKeyInfo> = self
+            .schema_cache
+            .get_child_fks(&table_name)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        if !child_fks.is_empty() && !upstream_pks.is_empty() {
+            match self.enforce_fk_delete(&table_name, &upstream_pks, child_fks).await {
+                Ok(fk_result) => {
+                    // Apply SET NULL updates
+                    for (child_table, fk_col, child_pks) in &fk_result.set_null_updates {
+                        let child_schema = match self.get_or_fetch_schema(child_table).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(conn_id = self.conn_id, error = %e, "FK SET NULL schema fetch failed");
+                                continue;
+                            }
+                        };
+                        let child_schema_pairs = child_schema.schema_pairs();
+                        let child_pk_col = child_schema.pk_column();
+
+                        let db = match &self.current_db {
+                            Some(db) => db.clone(),
+                            None => continue,
+                        };
+
+                        // Fetch full rows from upstream for affected children
+                        let in_values: Vec<String> = child_pks
+                            .iter()
+                            .map(|pk| format!("'{}'", pk.replace('\'', "''")))
+                            .collect();
+                        let in_clause = in_values.join(",");
+                        let col_names: Vec<String> = child_schema_pairs.iter().map(|(n, _)| format!("`{}`", n)).collect();
+                        let fetch_sql = format!(
+                            "SELECT {} FROM `{}` WHERE `{}` IN ({})",
+                            col_names.join(", "), child_table, child_pk_col, in_clause
+                        );
+
+                        let child_upstream_rows: Vec<Vec<(String, String)>> = if let Some(ref mut conn) = self.upstream {
+                            match conn.query::<Row, _>(&fetch_sql).await {
+                                Ok(rows) => rows.iter().map(|row| {
+                                    child_schema_pairs.iter().enumerate().map(|(i, (col_name, _))| {
+                                        let val = row.as_ref(i)
+                                            .map(|v| mysql_value_to_string(v))
+                                            .unwrap_or_else(|| "NULL".to_string());
+                                        (col_name.clone(), val)
+                                    }).collect()
+                                }).collect(),
+                                Err(e) => {
+                                    warn!(conn_id = self.conn_id, error = %e, "FK SET NULL upstream fetch failed");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            continue;
+                        };
+
+                        // Write SET NULL overlay rows
+                        {
+                            let store = match OverlayStore::open(&self.overlay_dir, &db) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(conn_id = self.conn_id, error = %e, "FK SET NULL overlay open failed");
+                                    continue;
+                                }
+                            };
+                            let row_store = crate::overlay::row_store::RowStore::new(&store.conn);
+                            let col_refs: Vec<(&str, &str)> = child_schema_pairs.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+                            if let Err(e) = row_store.ensure_shadow_table(child_table, &col_refs) {
+                                warn!(conn_id = self.conn_id, error = %e, "FK SET NULL ensure shadow failed");
+                                continue;
+                            }
+                            let shadow = format!("_cow_data_{}", child_table);
+
+                            for upstream_row in &child_upstream_rows {
+                                let cow_pk = upstream_row.iter()
+                                    .find(|(c, _)| c.eq_ignore_ascii_case(&child_pk_col))
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_else(|| "unknown".to_string());
+
+                                // Build column names and values for INSERT OR REPLACE
+                                let mut col_names_sql = vec!["_cow_pk".to_string(), "_cow_op".to_string()];
+                                let mut placeholders = vec!["?".to_string(), "'UPDATE'".to_string()];
+                                let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(cow_pk.clone())];
+
+                                for (col_name, col_val) in upstream_row {
+                                    col_names_sql.push(format!("\"{}\"", col_name));
+                                    if col_name.eq_ignore_ascii_case(fk_col) {
+                                        placeholders.push("NULL".to_string());
+                                    } else {
+                                        placeholders.push("?".to_string());
+                                        values.push(Box::new(col_val.clone()));
+                                    }
+                                }
+
+                                let upsert_sql = format!(
+                                    "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+                                    shadow,
+                                    col_names_sql.join(", "),
+                                    placeholders.join(", ")
+                                );
+                                let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
+                                if let Err(e) = store.conn.execute(&upsert_sql, params.as_slice()) {
+                                    warn!(conn_id = self.conn_id, error = %e, "FK SET NULL upsert failed");
+                                }
+                            }
+
+                            let reg = crate::overlay::registry::Registry::new(&store.conn);
+                            let _ = reg.mark_dirty(child_table, crate::overlay::registry::DirtyKind::Data);
+                        }
+                        self.temp_tables.invalidate(child_table);
+                    }
+
+                    // Apply cascaded deletes
+                    for (child_table, child_pks) in &fk_result.cascaded_deletes {
+                        let child_schema = match self.get_or_fetch_schema(child_table).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(conn_id = self.conn_id, error = %e, "FK CASCADE schema fetch failed");
+                                continue;
+                            }
+                        };
+                        let child_schema_pairs = child_schema.schema_pairs();
+
+                        let db = match &self.current_db {
+                            Some(db) => db.clone(),
+                            None => continue,
+                        };
+
+                        // Write tombstones for cascaded child rows
+                        {
+                            let store = match OverlayStore::open(&self.overlay_dir, &db) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(conn_id = self.conn_id, error = %e, "FK CASCADE overlay open failed");
+                                    continue;
+                                }
+                            };
+                            let row_store = crate::overlay::row_store::RowStore::new(&store.conn);
+                            let col_refs: Vec<(&str, &str)> = child_schema_pairs.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+                            if let Err(e) = row_store.ensure_shadow_table(child_table, &col_refs) {
+                                warn!(conn_id = self.conn_id, error = %e, "FK CASCADE ensure shadow failed");
+                                continue;
+                            }
+                            let shadow = format!("_cow_data_{}", child_table);
+
+                            for pk in child_pks {
+                                let existing_op: Option<String> = store.conn.query_row(
+                                    &format!("SELECT _cow_op FROM \"{}\" WHERE _cow_pk = ?1", shadow),
+                                    rusqlite::params![pk],
+                                    |r| r.get(0),
+                                ).ok();
+
+                                let result = match existing_op.as_deref() {
+                                    Some("INSERT") => store.conn.execute(
+                                        &format!("DELETE FROM \"{}\" WHERE _cow_pk = ?1", shadow),
+                                        rusqlite::params![pk],
+                                    ),
+                                    Some(_) => store.conn.execute(
+                                        &format!("UPDATE \"{}\" SET _cow_op = 'DELETE' WHERE _cow_pk = ?1", shadow),
+                                        rusqlite::params![pk],
+                                    ),
+                                    None => store.conn.execute(
+                                        &format!("INSERT INTO \"{}\" (_cow_pk, _cow_op) VALUES (?1, 'DELETE')", shadow),
+                                        rusqlite::params![pk],
+                                    ),
+                                };
+                                if let Err(e) = result {
+                                    warn!(conn_id = self.conn_id, error = %e, "FK CASCADE tombstone write failed");
+                                }
+                            }
+
+                            let reg = crate::overlay::registry::Registry::new(&store.conn);
+                            let _ = reg.mark_dirty(child_table, crate::overlay::registry::DirtyKind::Data);
+                        }
+                        self.temp_tables.invalidate(child_table);
+
+                        // Recurse: child table might also have children
+                        if let Err(e) = self.enforce_fk_delete_recursive(child_table, child_pks, 1).await {
+                            warn!(conn_id = self.conn_id, error = %e, "FK recursive cascade failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    // RESTRICT or other FK violation — return error to client
+                    return Err(e.to_string());
+                }
+            }
+        }
+
+        // Open overlay store and execute delete
+        let db = match &self.current_db {
+            Some(db) => db.clone(),
+            None => {
+                warn!(conn_id = self.conn_id, "No database selected for overlay write");
+                return Ok(None);
+            }
+        };
+
+        match OverlayStore::open(&self.overlay_dir, &db) {
+            Ok(store) => {
+                match writer::execute_delete(&store, stmt, &schema, &upstream_pks) {
+                    Ok(wr) => Ok(Some((wr, table_name))),
+                    Err(e) => {
+                        warn!(conn_id = self.conn_id, error = %e, "Overlay DELETE failed");
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(conn_id = self.conn_id, error = %e, "Failed to open overlay store");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Handle an overlay DDL statement (CREATE TABLE, ALTER TABLE, DROP TABLE, TRUNCATE).
+    async fn handle_overlay_ddl(
+        &mut self,
+        sql: &str,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<Option<(crate::overlay::writer::WriteResult, String)>, String> {
+        // Extract table name for cache invalidation.
+        let ddl_table_name: String = match stmt {
+            sqlparser::ast::Statement::CreateTable(c) => {
+                writer::object_name_to_table(&c.name).unwrap_or_default()
+            }
+            sqlparser::ast::Statement::AlterTable(alter) => {
+                writer::object_name_to_table(&alter.name).unwrap_or_default()
+            }
+            sqlparser::ast::Statement::Drop { names, .. } => {
+                names.first()
+                    .and_then(|n| writer::object_name_to_table(n).ok())
+                    .unwrap_or_default()
+            }
+            sqlparser::ast::Statement::Truncate(truncate) => {
+                truncate.table_names.first()
+                    .and_then(|t| writer::object_name_to_table(&t.name).ok())
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+
+        let db = match &self.current_db {
+            Some(db) => db.clone(),
+            None => {
+                warn!(conn_id = self.conn_id, "No database selected for DDL overlay write");
+                return Ok(None);
+            }
+        };
+
+        match OverlayStore::open(&self.overlay_dir, &db) {
+            Ok(store) => {
+                match writer::execute_ddl(&store, sql, stmt) {
+                    Ok(wr) => {
+                        // Invalidate schema cache so the next access re-fetches.
+                        if !ddl_table_name.is_empty() {
+                            self.schema_cache.invalidate(&ddl_table_name);
+                        }
+                        Ok(Some((wr, ddl_table_name)))
+                    }
+                    Err(e) => {
+                        warn!(conn_id = self.conn_id, error = %e, "Overlay DDL failed");
+                        Ok(None)
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(conn_id = self.conn_id, error = %e, "Failed to open overlay store for DDL");
+                Ok(None)
             }
         }
     }
@@ -1217,33 +1750,14 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                 let columns_arc = result.columns();
                 match columns_arc {
                     Some(cols) if !cols.is_empty() => {
-                        let opensrv_cols: Vec<Column> = cols
-                            .iter()
-                            .map(|c| Column {
-                                table: c.table_str().to_string(),
-                                column: c.name_str().to_string(),
-                                coltype: mysql_col_type_to_opensrv(c.column_type()),
-                                colflags: mysql_flags_to_opensrv(c.flags()),
-                            })
-                            .collect();
+                        let opensrv_cols = build_opensrv_columns(&cols);
 
-                        let num_cols = opensrv_cols.len();
                         let rows: Vec<Row> = result.collect().await.map_err(|e| {
                             io::Error::new(io::ErrorKind::Other, format!("upstream error: {}", e))
                         })?;
                         drop(result);
 
-                        let mut row_writer = results.start(&opensrv_cols).await?;
-                        for row in &rows {
-                            for i in 0..num_cols {
-                                let val: Option<Vec<u8>> = row
-                                    .as_ref(i)
-                                    .and_then(|v| mysql_value_to_bytes(v));
-                                row_writer.write_col(val)?;
-                            }
-                            row_writer.end_row().await?;
-                        }
-                        row_writer.finish().await?;
+                        write_result_rows(&opensrv_cols, &rows, results).await?;
                     }
                     _ => {
                         let affected = result.affected_rows();
@@ -1388,8 +1902,8 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
         // Refresh dirty tables on each query (could be optimized later)
         self.refresh_dirty_tables();
 
-        // Refresh PK column map so the rewriter uses the correct column per table.
-        self.refresh_pk_columns();
+        // Compute PK column map so the rewriter uses the correct column per table.
+        let pk_columns = self.compute_pk_columns();
 
         // Route the query
         if !self.truncated_tables.is_empty() {
@@ -1399,7 +1913,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                 "Routing with truncated tables"
             );
         }
-        let action = query_handler::route_query(query, &self.dirty_tables, &self.pk_columns, &self.truncated_tables);
+        let action = query_handler::route_query(query, &self.dirty_tables, &pk_columns, &self.truncated_tables);
 
         match action {
             QueryAction::Passthrough(sql) => {
@@ -1425,563 +1939,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                     // Continue without FK enforcement rather than failing the write entirely
                 }
 
-                // Try to handle INSERT/UPDATE/DELETE via the overlay writer.
-                // Returns Result<Option<(WriteResult, table_name)>, String> —
-                // Err holds a client-facing error message (e.g. FK RESTRICT violation).
-                let write_result: Result<Option<(crate::overlay::writer::WriteResult, String)>, String> = 'overlay: {
-                    // Re-parse the SQL to get the AST
-                    let sql = &overlay_result.message;
-                    let parsed = match crate::sql::parser::parse_query(sql) {
-                        Ok(kind) => kind,
-                        Err(e) => {
-                            warn!(conn_id = self.conn_id, error = %e, "Failed to re-parse overlay SQL");
-                            break 'overlay Ok(None);
-                        }
-                    };
-
-                    use crate::sql::parser::QueryKind;
-
-                    match parsed {
-                        QueryKind::Insert(stmt) => {
-                            // Extract table name for schema fetch
-                            let table_name = match &stmt {
-                                sqlparser::ast::Statement::Insert(insert) => {
-                                    match &insert.table {
-                                        sqlparser::ast::TableObject::TableName(name) => {
-                                            name.0.last()
-                                                .and_then(|p| p.as_ident())
-                                                .map(|i| i.value.clone())
-                                        }
-                                        _ => None,
-                                    }
-                                }
-                                _ => None,
-                            };
-
-                            let table_name = match table_name {
-                                Some(t) => t,
-                                None => {
-                                    warn!(conn_id = self.conn_id, "Could not extract table name from INSERT");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-
-                            // Detect INSERT ... SELECT: source is a Query whose body is
-                            // not a simple VALUES clause. Fall through to passthrough so
-                            // we don't crash; full overlay support is a TODO.
-                            if let sqlparser::ast::Statement::Insert(insert) = &stmt {
-                                if let Some(source) = &insert.source {
-                                    let is_values = matches!(
-                                        source.body.as_ref(),
-                                        sqlparser::ast::SetExpr::Values(_)
-                                    );
-                                    if !is_values {
-                                        warn!(
-                                            conn_id = self.conn_id,
-                                            table = %table_name,
-                                            "INSERT ... SELECT detected — falling through to passthrough (TODO: full overlay support)"
-                                        );
-                                        break 'overlay Ok(None);
-                                    }
-                                }
-                            }
-
-                            // Detect INSERT ... ON DUPLICATE KEY UPDATE: for now fall
-                            // through to passthrough to avoid crashes. Full UPSERT
-                            // support (try INSERT, catch PK conflict, do UPDATE) is a TODO.
-                            if let sqlparser::ast::Statement::Insert(insert) = &stmt {
-                                if let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_)) = &insert.on {
-                                    warn!(
-                                        conn_id = self.conn_id,
-                                        table = %table_name,
-                                        "INSERT ... ON DUPLICATE KEY UPDATE detected — falling through to passthrough (TODO: full overlay support)"
-                                    );
-                                    break 'overlay Ok(None);
-                                }
-                            }
-
-                            // Fetch (or retrieve from cache) schema + defaults.
-                            let cached_schema = match self.get_or_fetch_schema(&table_name).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    warn!(conn_id = self.conn_id, error = %e, "Failed to fetch table schema");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-                            let schema = cached_schema.schema_pairs();
-                            let defaults = cached_schema.defaults();
-
-                            // Open overlay store and execute insert
-                            let db = match &self.current_db {
-                                Some(db) => db.clone(),
-                                None => {
-                                    warn!(conn_id = self.conn_id, "No database selected for overlay write");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-
-                            match OverlayStore::open(&self.overlay_dir, &db) {
-                                Ok(store) => {
-                                    match writer::execute_insert(&store, &stmt, &schema, &defaults) {
-                                        Ok(wr) => Ok(Some((wr, table_name.clone()))),
-                                        Err(e) => {
-                                            warn!(conn_id = self.conn_id, error = %e, "Overlay INSERT failed");
-                                            break 'overlay Ok(None);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(conn_id = self.conn_id, error = %e, "Failed to open overlay store");
-                                    break 'overlay Ok(None);
-                                }
-                            }
-                        }
-
-                        QueryKind::Update(stmt) => {
-                            // Extract table name and WHERE clause from UPDATE
-                            let (table_name, where_clause) = match &stmt {
-                                sqlparser::ast::Statement::Update(update) => {
-                                    let tname = match &update.table.relation {
-                                        sqlparser::ast::TableFactor::Table { name, .. } => {
-                                            name.0.last()
-                                                .and_then(|p| p.as_ident())
-                                                .map(|i| i.value.clone())
-                                        }
-                                        _ => None,
-                                    };
-                                    (tname, update.selection.as_ref().map(|e| e.to_string()))
-                                }
-                                _ => (None, None),
-                            };
-
-                            let table_name = match table_name {
-                                Some(t) => t,
-                                None => {
-                                    warn!(conn_id = self.conn_id, "Could not extract table name from UPDATE");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-
-                            // Fetch (or retrieve from cache) schema.
-                            let schema = match self.get_or_fetch_schema(&table_name).await {
-                                Ok(s) => s.schema_pairs(),
-                                Err(e) => {
-                                    warn!(conn_id = self.conn_id, error = %e, "Failed to fetch table schema");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-
-                            // Fetch affected rows from upstream: SELECT * FROM <table> WHERE <where>
-                            let select_sql = match &where_clause {
-                                Some(w) => format!("SELECT * FROM `{}` WHERE {}", table_name, w),
-                                None => format!("SELECT * FROM `{}`", table_name),
-                            };
-
-                            let upstream_rows: Vec<Vec<(String, String)>> = if let Some(ref mut conn) = self.upstream {
-                                let rows: Vec<Row> = match conn.query(&select_sql).await {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        warn!(conn_id = self.conn_id, error = %e, "Failed to fetch upstream rows for UPDATE");
-                                        break 'overlay Ok(None);
-                                    }
-                                };
-
-                                rows.iter().map(|row| {
-                                    schema.iter().enumerate().map(|(i, (col_name, _))| {
-                                        let val = row.as_ref(i)
-                                            .map(|v| mysql_value_to_string(v))
-                                            .unwrap_or_else(|| "NULL".to_string());
-                                        (col_name.clone(), val)
-                                    }).collect()
-                                }).collect()
-                            } else {
-                                break 'overlay Ok(None);
-                            };
-
-                            // Open overlay store and execute update
-                            let db = match &self.current_db {
-                                Some(db) => db.clone(),
-                                None => {
-                                    warn!(conn_id = self.conn_id, "No database selected for overlay write");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-
-                            match OverlayStore::open(&self.overlay_dir, &db) {
-                                Ok(store) => {
-                                    match writer::execute_update(&store, &stmt, &schema, &upstream_rows) {
-                                        Ok(wr) => Ok(Some((wr, table_name.clone()))),
-                                        Err(e) => {
-                                            warn!(conn_id = self.conn_id, error = %e, "Overlay UPDATE failed");
-                                            break 'overlay Ok(None);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(conn_id = self.conn_id, error = %e, "Failed to open overlay store");
-                                    break 'overlay Ok(None);
-                                }
-                            }
-                        }
-
-                        QueryKind::Delete(stmt) => {
-                            // Extract table name and WHERE clause from DELETE
-                            let (table_name, where_clause) = match &stmt {
-                                sqlparser::ast::Statement::Delete(delete) => {
-                                    let tables = match &delete.from {
-                                        sqlparser::ast::FromTable::WithFromKeyword(t) => t,
-                                        sqlparser::ast::FromTable::WithoutKeyword(t) => t,
-                                    };
-                                    let tname = tables.first().and_then(|twj| {
-                                        match &twj.relation {
-                                            sqlparser::ast::TableFactor::Table { name, .. } => {
-                                                name.0.last()
-                                                    .and_then(|p| p.as_ident())
-                                                    .map(|i| i.value.clone())
-                                            }
-                                            _ => None,
-                                        }
-                                    });
-                                    (tname, delete.selection.as_ref().map(|e| e.to_string()))
-                                }
-                                _ => (None, None),
-                            };
-
-                            let table_name = match table_name {
-                                Some(t) => t,
-                                None => {
-                                    warn!(conn_id = self.conn_id, "Could not extract table name from DELETE");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-
-                            // Fetch (or retrieve from cache) schema.
-                            let cached_schema = match self.get_or_fetch_schema(&table_name).await {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    warn!(conn_id = self.conn_id, error = %e, "Failed to fetch table schema");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-                            let schema = cached_schema.schema_pairs();
-                            let pk_col = cached_schema.pk_column();
-
-                            // Fetch affected PKs from upstream: SELECT <pk> FROM <table> WHERE <where>
-                            let select_sql = match &where_clause {
-                                Some(w) => format!("SELECT `{}` FROM `{}` WHERE {}", pk_col, table_name, w),
-                                None => format!("SELECT `{}` FROM `{}`", pk_col, table_name),
-                            };
-
-                            let upstream_pks: Vec<String> = if let Some(ref mut conn) = self.upstream {
-                                let rows: Vec<Row> = match conn.query(&select_sql).await {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        warn!(conn_id = self.conn_id, error = %e, "Failed to fetch upstream PKs for DELETE");
-                                        break 'overlay Ok(None);
-                                    }
-                                };
-
-                                rows.iter().filter_map(|row| {
-                                    row.as_ref(0).map(|v| mysql_value_to_string(v))
-                                }).collect()
-                            } else {
-                                break 'overlay Ok(None);
-                            };
-
-                            // Enforce FK constraints before executing delete.
-                            // Clone child FKs to avoid borrow issues with &mut self.
-                            let child_fks: Vec<ForeignKeyInfo> = self
-                                .schema_cache
-                                .get_child_fks(&table_name)
-                                .into_iter()
-                                .cloned()
-                                .collect();
-
-                            if !child_fks.is_empty() && !upstream_pks.is_empty() {
-                                match self.enforce_fk_delete(&table_name, &upstream_pks, child_fks).await {
-                                    Ok(fk_result) => {
-                                        // Apply SET NULL updates
-                                        for (child_table, fk_col, child_pks) in &fk_result.set_null_updates {
-                                            let child_schema = match self.get_or_fetch_schema(child_table).await {
-                                                Ok(s) => s,
-                                                Err(e) => {
-                                                    warn!(conn_id = self.conn_id, error = %e, "FK SET NULL schema fetch failed");
-                                                    continue;
-                                                }
-                                            };
-                                            let child_schema_pairs = child_schema.schema_pairs();
-                                            let child_pk_col = child_schema.pk_column();
-
-                                            let db = match &self.current_db {
-                                                Some(db) => db.clone(),
-                                                None => continue,
-                                            };
-
-                                            // Fetch full rows from upstream for affected children
-                                            let in_values: Vec<String> = child_pks
-                                                .iter()
-                                                .map(|pk| format!("'{}'", pk.replace('\'', "''")))
-                                                .collect();
-                                            let in_clause = in_values.join(",");
-                                            let col_names: Vec<String> = child_schema_pairs.iter().map(|(n, _)| format!("`{}`", n)).collect();
-                                            let fetch_sql = format!(
-                                                "SELECT {} FROM `{}` WHERE `{}` IN ({})",
-                                                col_names.join(", "), child_table, child_pk_col, in_clause
-                                            );
-
-                                            let child_upstream_rows: Vec<Vec<(String, String)>> = if let Some(ref mut conn) = self.upstream {
-                                                match conn.query::<Row, _>(&fetch_sql).await {
-                                                    Ok(rows) => rows.iter().map(|row| {
-                                                        child_schema_pairs.iter().enumerate().map(|(i, (col_name, _))| {
-                                                            let val = row.as_ref(i)
-                                                                .map(|v| mysql_value_to_string(v))
-                                                                .unwrap_or_else(|| "NULL".to_string());
-                                                            (col_name.clone(), val)
-                                                        }).collect()
-                                                    }).collect(),
-                                                    Err(e) => {
-                                                        warn!(conn_id = self.conn_id, error = %e, "FK SET NULL upstream fetch failed");
-                                                        continue;
-                                                    }
-                                                }
-                                            } else {
-                                                continue;
-                                            };
-
-                                            // Write SET NULL overlay rows
-                                            {
-                                                let store = match OverlayStore::open(&self.overlay_dir, &db) {
-                                                    Ok(s) => s,
-                                                    Err(e) => {
-                                                        warn!(conn_id = self.conn_id, error = %e, "FK SET NULL overlay open failed");
-                                                        continue;
-                                                    }
-                                                };
-                                                let row_store = crate::overlay::row_store::RowStore::new(&store.conn);
-                                                let col_refs: Vec<(&str, &str)> = child_schema_pairs.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
-                                                if let Err(e) = row_store.ensure_shadow_table(child_table, &col_refs) {
-                                                    warn!(conn_id = self.conn_id, error = %e, "FK SET NULL ensure shadow failed");
-                                                    continue;
-                                                }
-                                                let shadow = format!("_cow_data_{}", child_table);
-
-                                                for upstream_row in &child_upstream_rows {
-                                                    let cow_pk = upstream_row.iter()
-                                                        .find(|(c, _)| c.eq_ignore_ascii_case(&child_pk_col))
-                                                        .map(|(_, v)| v.clone())
-                                                        .unwrap_or_else(|| "unknown".to_string());
-
-                                                    // Build column names and values for INSERT OR REPLACE
-                                                    let mut col_names_sql = vec!["_cow_pk".to_string(), "_cow_op".to_string()];
-                                                    let mut placeholders = vec!["?".to_string(), "'UPDATE'".to_string()];
-                                                    let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(cow_pk.clone())];
-
-                                                    for (col_name, col_val) in upstream_row {
-                                                        col_names_sql.push(format!("\"{}\"", col_name));
-                                                        if col_name.eq_ignore_ascii_case(fk_col) {
-                                                            placeholders.push("NULL".to_string());
-                                                        } else {
-                                                            placeholders.push("?".to_string());
-                                                            values.push(Box::new(col_val.clone()));
-                                                        }
-                                                    }
-
-                                                    let upsert_sql = format!(
-                                                        "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-                                                        shadow,
-                                                        col_names_sql.join(", "),
-                                                        placeholders.join(", ")
-                                                    );
-                                                    let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
-                                                    if let Err(e) = store.conn.execute(&upsert_sql, params.as_slice()) {
-                                                        warn!(conn_id = self.conn_id, error = %e, "FK SET NULL upsert failed");
-                                                    }
-                                                }
-
-                                                let reg = crate::overlay::registry::Registry::new(&store.conn);
-                                                let _ = reg.mark_dirty(child_table, crate::overlay::registry::DirtyKind::Data);
-                                            }
-                                            self.temp_tables.invalidate(child_table);
-                                        }
-
-                                        // Apply cascaded deletes
-                                        for (child_table, child_pks) in &fk_result.cascaded_deletes {
-                                            let child_schema = match self.get_or_fetch_schema(child_table).await {
-                                                Ok(s) => s,
-                                                Err(e) => {
-                                                    warn!(conn_id = self.conn_id, error = %e, "FK CASCADE schema fetch failed");
-                                                    continue;
-                                                }
-                                            };
-                                            let child_schema_pairs = child_schema.schema_pairs();
-
-                                            let db = match &self.current_db {
-                                                Some(db) => db.clone(),
-                                                None => continue,
-                                            };
-
-                                            // Write tombstones for cascaded child rows
-                                            {
-                                                let store = match OverlayStore::open(&self.overlay_dir, &db) {
-                                                    Ok(s) => s,
-                                                    Err(e) => {
-                                                        warn!(conn_id = self.conn_id, error = %e, "FK CASCADE overlay open failed");
-                                                        continue;
-                                                    }
-                                                };
-                                                let row_store = crate::overlay::row_store::RowStore::new(&store.conn);
-                                                let col_refs: Vec<(&str, &str)> = child_schema_pairs.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
-                                                if let Err(e) = row_store.ensure_shadow_table(child_table, &col_refs) {
-                                                    warn!(conn_id = self.conn_id, error = %e, "FK CASCADE ensure shadow failed");
-                                                    continue;
-                                                }
-                                                let shadow = format!("_cow_data_{}", child_table);
-
-                                                for pk in child_pks {
-                                                    let existing_op: Option<String> = store.conn.query_row(
-                                                        &format!("SELECT _cow_op FROM \"{}\" WHERE _cow_pk = ?1", shadow),
-                                                        rusqlite::params![pk],
-                                                        |r| r.get(0),
-                                                    ).ok();
-
-                                                    let result = match existing_op.as_deref() {
-                                                        Some("INSERT") => store.conn.execute(
-                                                            &format!("DELETE FROM \"{}\" WHERE _cow_pk = ?1", shadow),
-                                                            rusqlite::params![pk],
-                                                        ),
-                                                        Some(_) => store.conn.execute(
-                                                            &format!("UPDATE \"{}\" SET _cow_op = 'DELETE' WHERE _cow_pk = ?1", shadow),
-                                                            rusqlite::params![pk],
-                                                        ),
-                                                        None => store.conn.execute(
-                                                            &format!("INSERT INTO \"{}\" (_cow_pk, _cow_op) VALUES (?1, 'DELETE')", shadow),
-                                                            rusqlite::params![pk],
-                                                        ),
-                                                    };
-                                                    if let Err(e) = result {
-                                                        warn!(conn_id = self.conn_id, error = %e, "FK CASCADE tombstone write failed");
-                                                    }
-                                                }
-
-                                                let reg = crate::overlay::registry::Registry::new(&store.conn);
-                                                let _ = reg.mark_dirty(child_table, crate::overlay::registry::DirtyKind::Data);
-                                            }
-                                            self.temp_tables.invalidate(child_table);
-
-                                            // Recurse: child table might also have children
-                                            if let Err(e) = self.enforce_fk_delete_recursive(child_table, child_pks, 1).await {
-                                                warn!(conn_id = self.conn_id, error = %e, "FK recursive cascade failed");
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // RESTRICT or other FK violation — return error to client
-                                        break 'overlay Err(e.to_string());
-                                    }
-                                }
-                            }
-
-                            // Open overlay store and execute delete
-                            let db = match &self.current_db {
-                                Some(db) => db.clone(),
-                                None => {
-                                    warn!(conn_id = self.conn_id, "No database selected for overlay write");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-
-                            match OverlayStore::open(&self.overlay_dir, &db) {
-                                Ok(store) => {
-                                    match writer::execute_delete(&store, &stmt, &schema, &upstream_pks) {
-                                        Ok(wr) => Ok(Some((wr, table_name.clone()))),
-                                        Err(e) => {
-                                            warn!(conn_id = self.conn_id, error = %e, "Overlay DELETE failed");
-                                            break 'overlay Ok(None);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(conn_id = self.conn_id, error = %e, "Failed to open overlay store");
-                                    break 'overlay Ok(None);
-                                }
-                            }
-                        }
-
-                        QueryKind::Ddl(stmt) => {
-                            // Handle CREATE TABLE / ALTER TABLE / DROP TABLE in the overlay
-                            let sql = &overlay_result.message;
-
-                            // Extract table name for cache invalidation.
-                            let ddl_table_name: String = match &stmt {
-                                sqlparser::ast::Statement::CreateTable(c) => {
-                                    c.name.0.last()
-                                        .and_then(|p| p.as_ident())
-                                        .map(|i| i.value.clone())
-                                        .unwrap_or_default()
-                                }
-                                sqlparser::ast::Statement::AlterTable(alter) => {
-                                    alter.name.0.last()
-                                        .and_then(|p| p.as_ident())
-                                        .map(|i| i.value.clone())
-                                        .unwrap_or_default()
-                                }
-                                sqlparser::ast::Statement::Drop { names, .. } => {
-                                    names.first()
-                                        .and_then(|n| n.0.last())
-                                        .and_then(|p| p.as_ident())
-                                        .map(|i| i.value.clone())
-                                        .unwrap_or_default()
-                                }
-                                sqlparser::ast::Statement::Truncate(truncate) => {
-                                    truncate.table_names.first()
-                                        .and_then(|t| t.name.0.last())
-                                        .and_then(|p| p.as_ident())
-                                        .map(|i| i.value.clone())
-                                        .unwrap_or_default()
-                                }
-                                _ => String::new(),
-                            };
-
-                            let db = match &self.current_db {
-                                Some(db) => db.clone(),
-                                None => {
-                                    warn!(conn_id = self.conn_id, "No database selected for DDL overlay write");
-                                    break 'overlay Ok(None);
-                                }
-                            };
-
-                            match OverlayStore::open(&self.overlay_dir, &db) {
-                                Ok(store) => {
-                                    match writer::execute_ddl(&store, sql, &stmt) {
-                                        Ok(wr) => {
-                                            // Invalidate schema cache so the next access re-fetches.
-                                            if !ddl_table_name.is_empty() {
-                                                self.schema_cache.invalidate(&ddl_table_name);
-                                            }
-                                            Ok(Some((wr, ddl_table_name)))
-                                        }
-                                        Err(e) => {
-                                            warn!(conn_id = self.conn_id, error = %e, "Overlay DDL failed");
-                                            break 'overlay Ok(None);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(conn_id = self.conn_id, error = %e, "Failed to open overlay store for DDL");
-                                    break 'overlay Ok(None);
-                                }
-                            }
-                        }
-
-                        _ => {
-                            // Other overlay-handled statements — not yet implemented
-                            break 'overlay Ok(None);
-                        }
-                    }
-                };
-
-                // Handle FK RESTRICT violations: send error to client and return.
-                let write_result = match write_result {
+                let write_result = match self.handle_overlay_write(&overlay_result.message).await {
                     Ok(v) => v,
                     Err(fk_err) => {
                         results
@@ -2083,7 +2041,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                         let dirty_refs: Vec<&str> = self.dirty_tables.iter().map(|s| s.as_str()).collect();
                         let truncated_refs: Vec<&str> = self.truncated_tables.iter().map(|s| s.as_str()).collect();
                         match crate::sql::sp_rewriter::rewrite_sp_from_definition_statements(
-                            &create_sql, &dirty_refs, "_cow_temp_", &self.pk_columns, &truncated_refs,
+                            &create_sql, &dirty_refs, "_cow_temp_", &pk_columns, &truncated_refs,
                         ) {
                             Ok(stmts) if !stmts.is_empty() => {
                                 debug!(conn_id = self.conn_id, stmt_count = stmts.len(), "Executing rewritten SP statements");
@@ -2129,6 +2087,37 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
 
         Ok(())
     }
+}
+
+/// Build opensrv-mysql `Column` descriptors from mysql_async column metadata.
+fn build_opensrv_columns(cols: &[mysql_async::Column]) -> Vec<Column> {
+    cols.iter()
+        .map(|c| Column {
+            table: c.table_str().to_string(),
+            column: c.name_str().to_string(),
+            coltype: mysql_col_type_to_opensrv(c.column_type()),
+            colflags: mysql_flags_to_opensrv(c.flags()),
+        })
+        .collect()
+}
+
+/// Write rows from a collected result set to the client via opensrv-mysql.
+async fn write_result_rows<W: AsyncWrite + Unpin + Send>(
+    opensrv_cols: &[Column],
+    rows: &[Row],
+    results: QueryResultWriter<'_, W>,
+) -> io::Result<()> {
+    let num_cols = opensrv_cols.len();
+    let mut row_writer = results.start(opensrv_cols).await?;
+    for row in rows {
+        for i in 0..num_cols {
+            let val: Option<Vec<u8>> = row.as_ref(i).and_then(|v| mysql_value_to_bytes(v));
+            row_writer.write_col(val)?;
+        }
+        row_writer.end_row().await?;
+    }
+    row_writer.finish().await?;
+    Ok(())
 }
 
 /// Convert an opensrv-mysql `ValueInner` (from a client EXECUTE packet) into a
