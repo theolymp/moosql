@@ -95,6 +95,10 @@ pub struct CowHandler {
     /// Cached PK column map (table_name -> pk_column_name), rebuilt whenever
     /// dirty_tables is refreshed. Avoids recomputing on every query.
     pk_columns_cache: HashMap<String, String>,
+    /// Whether live query logging to stdout is enabled.
+    watch: bool,
+    /// Optional filter: only log queries whose SQL or action contains this substring (case-insensitive).
+    watch_filter: Option<String>,
 }
 
 impl CowHandler {
@@ -103,6 +107,8 @@ impl CowHandler {
         upstream_user: String,
         upstream_password: String,
         overlay_dir: PathBuf,
+        watch: bool,
+        watch_filter: Option<String>,
     ) -> Self {
         Self {
             upstream: None,
@@ -121,7 +127,46 @@ impl CowHandler {
             schema_cache: SchemaCache::new(),
             dirty_tables_stale: true,
             pk_columns_cache: HashMap::new(),
+            watch,
+            watch_filter,
         }
+    }
+
+    /// Print a watch log line if watch mode is enabled and the filter (if any) matches.
+    fn watch_log(&self, action: &str, sql: &str, elapsed_ms: f64) {
+        if !self.watch {
+            return;
+        }
+        if let Some(ref filter) = self.watch_filter {
+            let filter_lower = filter.to_ascii_lowercase();
+            if !sql.to_ascii_lowercase().contains(&filter_lower)
+                && !action.to_ascii_lowercase().contains(&filter_lower)
+            {
+                return;
+            }
+        }
+        // Build a simple UTC timestamp from SystemTime without pulling in chrono.
+        let ts = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let s = secs % 86400;
+            let h = s / 3600;
+            let m = (s % 3600) / 60;
+            let sec = s % 60;
+            let days = secs / 86400;
+            let (year, month, day) = days_to_ymd(days);
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                year, month, day, h, m, sec
+            )
+        };
+        println!(
+            "[{}] conn={} {:<12} {:.1}ms {}",
+            ts, self.conn_id, action, elapsed_ms, sql
+        );
     }
 
     /// Connect to the upstream MariaDB server with given credentials.
@@ -2349,4 +2394,19 @@ fn is_connection_error(e: &mysql_async::Error) -> bool {
         }
         _ => false,
     }
+}
+
+fn days_to_ymd(days: u64) -> (u32, u32, u32) {
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u32, m as u32, d as u32)
 }

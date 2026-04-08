@@ -123,6 +123,80 @@ async fn seed_database(pool: &mysql_async::Pool) {
     )
     .await
     .expect("INSERT orders failed");
+
+    // Third table for multi-table JOINs.
+    conn.query_drop(
+        "CREATE TABLE IF NOT EXISTS categories (
+            id   INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100) NOT NULL
+        )",
+    )
+    .await
+    .expect("CREATE TABLE categories failed");
+
+    conn.query_drop(
+        "INSERT INTO categories (name) VALUES ('Electronics'), ('Accessories')",
+    )
+    .await
+    .expect("INSERT categories failed");
+
+    // Products table with category FK for multi-table JOIN tests.
+    conn.query_drop(
+        "CREATE TABLE IF NOT EXISTS products (
+            id          INT AUTO_INCREMENT PRIMARY KEY,
+            name        VARCHAR(100) NOT NULL,
+            category_id INT NOT NULL,
+            price       DECIMAL(10,2) NOT NULL DEFAULT 0.00
+        )",
+    )
+    .await
+    .expect("CREATE TABLE products failed");
+
+    conn.query_drop(
+        "INSERT INTO products (name, category_id, price) VALUES
+            ('Widget', 1, 9.99),
+            ('Gadget', 1, 19.99),
+            ('Cable',  2, 4.99)",
+    )
+    .await
+    .expect("INSERT products failed");
+
+    // Employees table for self-join (manager hierarchy) test.
+    conn.query_drop(
+        "CREATE TABLE IF NOT EXISTS employees (
+            id         INT AUTO_INCREMENT PRIMARY KEY,
+            name       VARCHAR(100) NOT NULL,
+            manager_id INT DEFAULT NULL
+        )",
+    )
+    .await
+    .expect("CREATE TABLE employees failed");
+
+    conn.query_drop(
+        "INSERT INTO employees (name, manager_id) VALUES
+            ('CEO', NULL),
+            ('VP', 1),
+            ('Engineer', 2),
+            ('Intern', 2)",
+    )
+    .await
+    .expect("INSERT employees failed");
+
+    // A stored procedure for SP rewriting tests.
+    conn.query_drop(
+        "DROP PROCEDURE IF EXISTS get_user_by_id",
+    )
+    .await
+    .expect("DROP PROCEDURE failed");
+
+    conn.query_drop(
+        "CREATE PROCEDURE get_user_by_id(IN uid INT)
+         BEGIN
+             SELECT id, name, email FROM users WHERE id = uid;
+         END",
+    )
+    .await
+    .expect("CREATE PROCEDURE failed");
 }
 
 /// Kill the Docker container.
@@ -226,7 +300,9 @@ impl Drop for Fixture {
     }
 }
 
-// ── tests ─────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// Core Proxy Tests
+// ══════════════════════════════════════════════════════════════════════════════
 
 /// SELECT through the proxy returns the same rows as a direct query.
 #[tokio::test]
@@ -339,7 +415,7 @@ async fn test_delete_overlay() {
     assert_eq!(up_name.as_deref(), Some("Bob"));
 }
 
-/// INSERT without specifying all columns — the omitted column (`active`)
+/// INSERT without specifying all columns -- the omitted column (`active`)
 /// should receive its DEFAULT value and be returned correctly.
 #[tokio::test]
 #[ignore]
@@ -422,4 +498,425 @@ async fn test_join_with_dirty() {
     assert_eq!(rows[0], ("Alicia".to_string(), "Widget".to_string()));
     // Row 2: unmodified name, order from upstream.
     assert_eq!(rows[1], ("Bob".to_string(), "Gadget".to_string()));
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Complex Query Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Multi-table JOIN: users + orders + products across 3 tables.
+#[tokio::test]
+#[ignore]
+async fn test_multi_table_join() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Dirty products via overlay
+    conn.query_drop("UPDATE products SET price = 12.99 WHERE id = 1")
+        .await
+        .unwrap();
+
+    let rows: Vec<(String, String, String)> = conn
+        .query(
+            "SELECT u.name, o.product, p.name \
+             FROM users u \
+             JOIN orders o ON o.user_id = u.id \
+             JOIN products p ON p.name = o.product \
+             ORDER BY u.id",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "Alice");
+    assert_eq!(rows[0].1, "Widget");
+    assert_eq!(rows[0].2, "Widget");
+}
+
+/// Self-join: employee manager hierarchy.
+#[tokio::test]
+#[ignore]
+async fn test_self_join() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Overlay-update a manager name
+    conn.query_drop("UPDATE employees SET name = 'VicePresident' WHERE id = 2")
+        .await
+        .unwrap();
+
+    let rows: Vec<(String, String)> = conn
+        .query(
+            "SELECT e.name, m.name \
+             FROM employees e \
+             JOIN employees m ON e.manager_id = m.id \
+             ORDER BY e.id",
+        )
+        .await
+        .unwrap();
+
+    // VP(2) -> CEO(1), Engineer(3) -> VP(2), Intern(4) -> VP(2)
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], ("VicePresident".to_string(), "CEO".to_string()));
+    assert_eq!(rows[1], ("Engineer".to_string(), "VicePresident".to_string()));
+    assert_eq!(rows[2], ("Intern".to_string(), "VicePresident".to_string()));
+}
+
+/// Subquery: WHERE IN (SELECT ...) referencing overlay data.
+#[tokio::test]
+#[ignore]
+async fn test_subquery() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Insert a new user in the overlay
+    conn.query_drop(
+        "INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@test.com')",
+    )
+    .await
+    .unwrap();
+
+    // Insert an order for Charlie (user_id will be 3)
+    conn.query_drop("INSERT INTO orders (user_id, product) VALUES (3, 'Thingamajig')")
+        .await
+        .unwrap();
+
+    // Subquery: orders for users named 'Charlie'
+    let rows: Vec<String> = conn
+        .query(
+            "SELECT o.product FROM orders o WHERE o.user_id IN \
+             (SELECT id FROM users WHERE name = 'Charlie')",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rows, vec!["Thingamajig".to_string()]);
+}
+
+/// GROUP BY with HAVING on a dirty table.
+#[tokio::test]
+#[ignore]
+async fn test_group_by_having() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Insert more products in overlay to create groups
+    conn.query_drop(
+        "INSERT INTO products (name, category_id, price) VALUES ('Doohickey', 1, 29.99)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(i32, i64)> = conn
+        .query(
+            "SELECT category_id, COUNT(*) as cnt FROM products \
+             GROUP BY category_id HAVING COUNT(*) >= 3 \
+             ORDER BY category_id",
+        )
+        .await
+        .unwrap();
+
+    // Category 1 now has Widget, Gadget, Doohickey = 3
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0], (1, 3));
+}
+
+/// UNION combining overlay and upstream data.
+#[tokio::test]
+#[ignore]
+async fn test_union_query() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Insert an overlay user
+    conn.query_drop(
+        "INSERT INTO users (name, email) VALUES ('UnionUser', 'union@test.com')",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(String,)> = conn
+        .query(
+            "SELECT name FROM users WHERE name = 'Alice' \
+             UNION ALL \
+             SELECT name FROM users WHERE name = 'UnionUser'",
+        )
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    assert!(names.contains(&"Alice"));
+    assert!(names.contains(&"UnionUser"));
+}
+
+/// EXISTS subquery referencing overlay data.
+#[tokio::test]
+#[ignore]
+async fn test_exists_subquery() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Delete Bob's order
+    conn.query_drop("DELETE FROM orders WHERE user_id = 2")
+        .await
+        .unwrap();
+
+    // Users who have at least one order (EXISTS)
+    let rows: Vec<String> = conn
+        .query(
+            "SELECT u.name FROM users u WHERE EXISTS \
+             (SELECT 1 FROM orders o WHERE o.user_id = u.id) \
+             ORDER BY u.id",
+        )
+        .await
+        .unwrap();
+
+    // Only Alice should remain (Bob's order was deleted)
+    assert_eq!(rows, vec!["Alice".to_string()]);
+}
+
+/// LIMIT and OFFSET on overlay-enriched results.
+#[tokio::test]
+#[ignore]
+async fn test_limit_offset() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Insert a third user
+    conn.query_drop(
+        "INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@test.com')",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<String> = conn
+        .query("SELECT name FROM users ORDER BY id LIMIT 2 OFFSET 1")
+        .await
+        .unwrap();
+
+    // Offset 1 means skip Alice, take Bob and Charlie
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], "Bob");
+    assert_eq!(rows[1], "Charlie");
+}
+
+/// NULL handling: IS NULL, COALESCE with overlay data.
+#[tokio::test]
+#[ignore]
+async fn test_null_handling() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Find employees with no manager (NULL manager_id)
+    let rows: Vec<String> = conn
+        .query(
+            "SELECT name FROM employees WHERE manager_id IS NULL",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec!["CEO".to_string()]);
+
+    // COALESCE: replace NULL manager_id with 0
+    let rows: Vec<(String, i64)> = conn
+        .query(
+            "SELECT name, COALESCE(manager_id, 0) FROM employees ORDER BY id LIMIT 1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows[0], ("CEO".to_string(), 0));
+}
+
+/// CASE expression with overlay data.
+#[tokio::test]
+#[ignore]
+async fn test_case_expression() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Insert overlay user with active = 0
+    conn.query_drop(
+        "INSERT INTO users (name, email, active) VALUES ('Inactive', 'inactive@test.com', 0)",
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(String, String)> = conn
+        .query(
+            "SELECT name, CASE WHEN active = 1 THEN 'yes' ELSE 'no' END as status \
+             FROM users ORDER BY id",
+        )
+        .await
+        .unwrap();
+
+    // Last row should be inactive
+    let last = rows.last().unwrap();
+    assert_eq!(last.0, "Inactive");
+    assert_eq!(last.1, "no");
+}
+
+/// COUNT includes overlay-inserted rows.
+#[tokio::test]
+#[ignore]
+async fn test_count_with_overlay() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Baseline count
+    let before: Option<i64> = conn
+        .query_first("SELECT COUNT(*) FROM users")
+        .await
+        .unwrap();
+
+    conn.query_drop(
+        "INSERT INTO users (name, email) VALUES ('Counted', 'counted@test.com')",
+    )
+    .await
+    .unwrap();
+
+    let after: Option<i64> = conn
+        .query_first("SELECT COUNT(*) FROM users")
+        .await
+        .unwrap();
+
+    assert_eq!(after.unwrap(), before.unwrap() + 1);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DDL Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// CREATE TABLE through the proxy should only exist in the overlay.
+#[tokio::test]
+#[ignore]
+async fn test_create_table_overlay() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop(
+        "CREATE TABLE test_overlay_only (
+            id   INT AUTO_INCREMENT PRIMARY KEY,
+            data VARCHAR(100)
+        )",
+    )
+    .await
+    .unwrap();
+
+    // Insert and read back through proxy
+    conn.query_drop("INSERT INTO test_overlay_only (data) VALUES ('hello')")
+        .await
+        .unwrap();
+
+    let rows: Vec<String> = conn
+        .query("SELECT data FROM test_overlay_only")
+        .await
+        .unwrap();
+    assert_eq!(rows, vec!["hello".to_string()]);
+
+    // Verify it does NOT exist upstream
+    let mut up_conn = fix.upstream.get_conn().await.unwrap();
+    let result = up_conn
+        .query_drop("SELECT 1 FROM test_overlay_only LIMIT 1")
+        .await;
+    assert!(result.is_err(), "Table should not exist in upstream");
+}
+
+/// TRUNCATE TABLE should hide all base rows through the proxy.
+#[tokio::test]
+#[ignore]
+async fn test_truncate_overlay() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Truncate the users table via proxy
+    conn.query_drop("TRUNCATE TABLE users").await.unwrap();
+
+    // Proxy should show 0 rows
+    let count: Option<i64> = conn
+        .query_first("SELECT COUNT(*) FROM users")
+        .await
+        .unwrap();
+    assert_eq!(count, Some(0), "Truncated table should show 0 rows via proxy");
+
+    // Upstream should still have its rows
+    let mut up_conn = fix.upstream.get_conn().await.unwrap();
+    let up_count: Option<i64> = up_conn
+        .query_first("SELECT COUNT(*) FROM users")
+        .await
+        .unwrap();
+    assert!(up_count.unwrap() > 0, "Upstream should still have rows");
+}
+
+/// SHOW TABLES should include overlay-created tables.
+#[tokio::test]
+#[ignore]
+async fn test_show_tables_includes_overlay() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop(
+        "CREATE TABLE new_overlay_table (id INT PRIMARY KEY, val TEXT)",
+    )
+    .await
+    .unwrap();
+
+    let tables: Vec<String> = conn.query("SHOW TABLES").await.unwrap();
+    assert!(
+        tables.iter().any(|t| t == "new_overlay_table"),
+        "SHOW TABLES should list overlay-created table, got: {:?}",
+        tables
+    );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Stored Procedure Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// CALL to a stored procedure should see overlay data.
+#[tokio::test]
+#[ignore]
+async fn test_stored_procedure_rewriting() {
+    let fix = Fixture::new().await;
+
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Update Alice's name in overlay
+    conn.query_drop("UPDATE users SET name = 'Alicia' WHERE id = 1")
+        .await
+        .unwrap();
+
+    // Call the stored procedure -- it should see the overlay data
+    let rows: Vec<(i32, String, String)> = conn
+        .query("CALL get_user_by_id(1)")
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "Alicia", "SP should see overlay-updated name");
 }

@@ -13,6 +13,8 @@ pub struct ProxyServer {
     pub upstream_user: String,
     pub upstream_password: String,
     pub overlay_dir: PathBuf,
+    pub watch: bool,
+    pub watch_filter: Option<String>,
 }
 
 impl ProxyServer {
@@ -22,6 +24,8 @@ impl ProxyServer {
         upstream_user: impl Into<String>,
         upstream_password: impl Into<String>,
         overlay_dir: impl Into<PathBuf>,
+        watch: bool,
+        watch_filter: Option<String>,
     ) -> Self {
         Self {
             listen_addr: listen_addr.into(),
@@ -29,6 +33,8 @@ impl ProxyServer {
             upstream_user: upstream_user.into(),
             upstream_password: upstream_password.into(),
             overlay_dir: overlay_dir.into(),
+            watch,
+            watch_filter,
         }
     }
 
@@ -51,9 +57,11 @@ impl ProxyServer {
                     let upstream_user = self.upstream_user.clone();
                     let upstream_password = self.upstream_password.clone();
                     let overlay_dir = self.overlay_dir.clone();
+                    let watch = self.watch;
+                    let watch_filter = self.watch_filter.clone();
 
                     tokio::spawn(async move {
-                        let handler = CowHandler::new(upstream_addr, upstream_user, upstream_password, overlay_dir);
+                        let handler = CowHandler::new(upstream_addr, upstream_user, upstream_password, overlay_dir, watch, watch_filter);
 
                         // Split the TCP stream into read/write halves for opensrv-mysql
                         let (reader, writer) = socket.into_split();
