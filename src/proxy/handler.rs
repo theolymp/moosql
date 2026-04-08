@@ -1014,6 +1014,132 @@ impl CowHandler {
         }
     }
 
+    /// Execute SHOW TABLES against upstream, then append any overlay-only tables
+    /// (tables created via DDL in the overlay that do not exist in upstream).
+    async fn forward_show_tables<W: AsyncWrite + Unpin + Send>(
+        &mut self,
+        sql: &str,
+        results: QueryResultWriter<'_, W>,
+    ) -> io::Result<()> {
+        // Gather overlay-only table names before forwarding (no async borrow conflict).
+        let overlay_only_tables: Vec<String> = if let Some(ref db) = self.current_db.clone() {
+            match OverlayStore::open(&self.overlay_dir, db) {
+                Ok(store) => {
+                    let reg = Registry::new(&store.conn);
+                    match reg.list_dirty() {
+                        Ok(dirty) => dirty
+                            .into_iter()
+                            .filter(|d| d.has_schema && !d.has_data)
+                            .map(|d| d.table_name)
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                Err(_) => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        if self.upstream.is_none() {
+            results
+                .error(ErrorKind::ER_UNKNOWN_ERROR, b"No upstream connection established")
+                .await?;
+            return Ok(());
+        }
+
+        // Execute SHOW TABLES on upstream.
+        let query_result = {
+            let conn = self.upstream.as_mut().unwrap();
+            conn.query_iter(sql).await
+        };
+
+        match query_result {
+            Ok(mut result) => {
+                let columns_arc = result.columns();
+                match columns_arc {
+                    Some(cols) if !cols.is_empty() => {
+                        let opensrv_cols = build_opensrv_columns(&cols);
+
+                        // Collect upstream rows.
+                        let rows: Vec<Row> = result.collect().await.map_err(|e| {
+                            io::Error::other(format!("upstream error: {}", e))
+                        })?;
+                        drop(result);
+
+                        // Build set of upstream table names (first column, lowercase).
+                        let upstream_names: std::collections::HashSet<String> = rows
+                            .iter()
+                            .filter_map(|r| {
+                                r.as_ref(0).and_then(|v| {
+                                    if let mysql_async::Value::Bytes(b) = v {
+                                        Some(String::from_utf8_lossy(b).to_lowercase())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .collect();
+
+                        // Append overlay-only tables not already in upstream results.
+                        // We write the upstream rows first, then inject extra rows.
+                        let num_cols = opensrv_cols.len();
+                        let mut rw = results.start(&opensrv_cols).await?;
+
+                        // Write upstream rows.
+                        for row in &rows {
+                            for i in 0..num_cols {
+                                let val: Option<Vec<u8>> =
+                                    row.as_ref(i).and_then(mysql_value_to_bytes);
+                                rw.write_col(val)?;
+                            }
+                            rw.end_row().await?;
+                        }
+
+                        // Write overlay-only extra rows.
+                        for table_name in &overlay_only_tables {
+                            if !upstream_names.contains(&table_name.to_lowercase()) {
+                                debug!(
+                                    conn_id = self.conn_id,
+                                    table = %table_name,
+                                    "Appending overlay-only table to SHOW TABLES"
+                                );
+                                // First column: table name. Remaining columns (for SHOW FULL TABLES): fill with default bytes.
+                                rw.write_col(Some(table_name.as_bytes().to_vec()))?;
+                                for _ in 1..num_cols {
+                                    rw.write_col(Some(b"BASE TABLE".to_vec()))?;
+                                }
+                                rw.end_row().await?;
+                            }
+                        }
+
+                        rw.finish().await?;
+                    }
+                    _ => {
+                        // No result set — just relay the OK.
+                        let affected = result.affected_rows();
+                        let last_insert = result.last_insert_id().unwrap_or(0);
+                        drop(result);
+                        let ok = OkResponse {
+                            affected_rows: affected,
+                            last_insert_id: last_insert,
+                            ..Default::default()
+                        };
+                        results.completed(ok).await?;
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("{}", e);
+                results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, msg.as_bytes())
+                    .await?;
+                Ok(())
+            }
+        }
+    }
+
     /// Handle an overlay write (INSERT/UPDATE/DELETE/DDL) by re-parsing the SQL,
     /// extracting the table name, fetching schemas, and dispatching to the
     /// appropriate overlay writer function.
@@ -1632,8 +1758,63 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
             }
         }
 
+        // Refresh dirty tables so we can detect if this SELECT needs rewriting.
+        self.refresh_dirty_tables();
+
+        // If this is a SELECT touching dirty tables, rewrite it before preparing
+        // so the upstream prepared statement targets the CoW temp tables.
+        let sql_to_prepare: String = {
+            use crate::sql::parser::QueryKind;
+            match crate::sql::parser::parse_query(query) {
+                Ok(QueryKind::Select(stmt)) => {
+                    let tables = crate::sql::table_extractor::extract_tables_from_stmt(&stmt);
+                    let dirty_refs: Vec<&str> = tables
+                        .iter()
+                        .filter(|t| self.dirty_tables.contains(t))
+                        .map(|t| t.as_str())
+                        .collect();
+
+                    if dirty_refs.is_empty() {
+                        query.to_string()
+                    } else {
+                        // Populate temp tables so the prepared statement can be validated.
+                        let tables_snapshot = self.dirty_tables.clone();
+                        if let Err(e) = self.populate_temp_tables(&tables_snapshot).await {
+                            warn!(conn_id = self.conn_id, error = %e, "Failed to populate temp tables for PREPARE");
+                        }
+
+                        let truncated_refs: Vec<&str> =
+                            self.truncated_tables.iter().map(|s| s.as_str()).collect();
+                        let pk_snap = self.pk_columns_cache.clone();
+                        match crate::sql::rewriter::rewrite_select(
+                            query,
+                            &dirty_refs,
+                            "_cow_temp_",
+                            &pk_snap,
+                            &truncated_refs,
+                        ) {
+                            Ok(rewritten) => {
+                                debug!(
+                                    conn_id = self.conn_id,
+                                    original = %query,
+                                    rewritten = %rewritten,
+                                    "Rewriting SELECT in PREPARE for dirty tables"
+                                );
+                                rewritten
+                            }
+                            Err(e) => {
+                                warn!(conn_id = self.conn_id, error = %e, "Failed to rewrite SELECT in PREPARE; using original");
+                                query.to_string()
+                            }
+                        }
+                    }
+                }
+                _ => query.to_string(),
+            }
+        };
+
         // Forward PREPARE to upstream.
-        let stmt = match self.upstream.as_mut().unwrap().prep(query).await {
+        let stmt = match self.upstream.as_mut().unwrap().prep(sql_to_prepare.as_str()).await {
             Ok(s) => s,
             Err(e) => {
                 let msg = format!("{}", e);
@@ -1903,7 +2084,17 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
         match action {
             QueryAction::Passthrough(sql) => {
                 debug!(conn_id = self.conn_id, "Passthrough query");
-                self.forward_query(&sql, results).await?;
+
+                // Special handling for SHOW TABLES: append overlay-only tables.
+                let upper_trimmed = sql.trim().to_ascii_uppercase();
+                if upper_trimmed == "SHOW TABLES"
+                    || upper_trimmed.starts_with("SHOW TABLES ")
+                    || upper_trimmed.starts_with("SHOW FULL TABLES")
+                {
+                    self.forward_show_tables(&sql, results).await?;
+                } else {
+                    self.forward_query(&sql, results).await?;
+                }
             }
 
             QueryAction::RewrittenSelect(sql) => {
