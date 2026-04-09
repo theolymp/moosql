@@ -8,7 +8,7 @@ RUN cargo build --release
 # Runtime stage
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/mariadb-cow /usr/local/bin/
+COPY --from=builder /app/target/release/moo /usr/local/bin/
 EXPOSE 3307
-ENTRYPOINT ["mariadb-cow"]
+ENTRYPOINT ["moo"]
 CMD ["start", "--listen=0.0.0.0:3307"]

@@ -1,25 +1,25 @@
-# mariadb-cow
+# moo
 
 Copy-on-Write proxy for MariaDB/MySQL — make changes freely, original stays untouched.
 
 ## What it does
 
-`mariadb-cow` sits in front of any MariaDB/MySQL database and intercepts every query. All writes (INSERT, UPDATE, DELETE, DDL) are redirected to a local SQLite overlay — the upstream database is never modified. When a SELECT touches a table that has overlay data, the proxy rewrites the query to merge the base and overlay results via temporary-table injection, so the client sees a consistent merged view.
+`moo` sits in front of any MariaDB/MySQL database and intercepts every query. All writes (INSERT, UPDATE, DELETE, DDL) are redirected to a local SQLite overlay — the upstream database is never modified. When a SELECT touches a table that has overlay data, the proxy rewrites the query to merge the base and overlay results via temporary-table injection, so the client sees a consistent merged view.
 
-Think of it as OverlayFS for databases: reads come from the real database, writes go to a local layer, and clients see both merged transparently. When you are done experimenting, run `mariadb-cow reset` and the overlay is gone, leaving the upstream exactly as it was. Or run `mariadb-cow apply` to write the overlay changes back into the upstream.
+Think of it as OverlayFS for databases: reads come from the real database, writes go to a local layer, and clients see both merged transparently. When you are done experimenting, run `moo reset` and the overlay is gone, leaving the upstream exactly as it was. Or run `moo apply` to write the overlay changes back into the upstream.
 
 ## Quick Start
 
 ```bash
 # 1. Build
 cargo build --release
-# Binary: target/release/mariadb-cow
+# Binary: target/release/moo
 
 # 2. Start MariaDB (if not already running)
 docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=secret mariadb:latest
 
 # 3. Start the proxy (listens on :3307, reads upstream on :3306)
-./target/release/mariadb-cow start \
+./target/release/moo start \
   --upstream=localhost:3306 \
   --listen=localhost:3307 \
   --user=root \
@@ -42,7 +42,7 @@ GRANT SELECT, CREATE TEMPORARY TABLES ON mydb.* TO 'cow_user'@'%';
 Start the proxy. CLI flags override config file values.
 
 ```bash
-mariadb-cow start \
+moo start \
   --upstream=localhost:3306 \
   --listen=localhost:3307 \
   --overlay=./dev-overlay \
@@ -52,11 +52,11 @@ mariadb-cow start \
   --config=cow.toml
 
 # Enable live query logging to stdout
-mariadb-cow start --upstream=localhost:3306 --watch
+moo start --upstream=localhost:3306 --watch
 
 # Filter watch output to specific operations or table names
-mariadb-cow start --upstream=localhost:3306 --watch --watch-filter=INSERT
-mariadb-cow start --upstream=localhost:3306 --watch --watch-filter=users
+moo start --upstream=localhost:3306 --watch --watch-filter=INSERT
+moo start --upstream=localhost:3306 --watch --watch-filter=users
 ```
 
 | Flag | Default | Description |
@@ -76,8 +76,8 @@ mariadb-cow start --upstream=localhost:3306 --watch --watch-filter=users
 Show overlay size and dirty table count.
 
 ```bash
-mariadb-cow status
-mariadb-cow status --overlay=./dev-overlay
+moo status
+moo status --overlay=./dev-overlay
 ```
 
 ### reset
@@ -85,9 +85,9 @@ mariadb-cow status --overlay=./dev-overlay
 Wipe the overlay. Resets all tables or a single named table.
 
 ```bash
-mariadb-cow reset                          # wipe everything
-mariadb-cow reset users                    # wipe only the users table
-mariadb-cow reset --overlay=./dev-overlay users
+moo reset                          # wipe everything
+moo reset users                    # wipe only the users table
+moo reset --overlay=./dev-overlay users
 ```
 
 ### tables
@@ -95,8 +95,8 @@ mariadb-cow reset --overlay=./dev-overlay users
 List every table that has overlay data, with flags indicating whether schema or row data is present.
 
 ```bash
-mariadb-cow tables
-mariadb-cow tables --overlay=./dev-overlay
+moo tables
+moo tables --overlay=./dev-overlay
 ```
 
 ### diff
@@ -105,25 +105,25 @@ Show what changed in the overlay compared to the base database.
 
 ```bash
 # Table-level summary (default)
-mariadb-cow diff
+moo diff
 
 # Row-level details
-mariadb-cow diff --verbose
+moo diff --verbose
 
 # Output as SQL statements
-mariadb-cow diff --format=sql
+moo diff --format=sql
 
 # Show old->new values for UPDATEs (requires upstream access)
-mariadb-cow diff --full \
+moo diff --full \
   --upstream=localhost:3306 \
   --user=root \
   --password=secret
 
 # Filter to a specific table or database
-mariadb-cow diff --table=users
-mariadb-cow diff --db=mydb --verbose
+moo diff --table=users
+moo diff --db=mydb --verbose
 
-mariadb-cow diff --overlay=./dev-overlay --format=sql
+moo diff --overlay=./dev-overlay --format=sql
 ```
 
 | Flag | Description |
@@ -143,20 +143,20 @@ Apply overlay changes to the upstream database. Requires write access to the ups
 
 ```bash
 # Preview what would be applied
-mariadb-cow apply \
+moo apply \
   --upstream=localhost:3306 \
   --user=root \
   --password=secret \
   --dry-run
 
 # Apply with confirmation prompt
-mariadb-cow apply \
+moo apply \
   --upstream=localhost:3306 \
   --user=root \
   --password=secret
 
 # Apply without prompt, then reset the overlay
-mariadb-cow apply \
+moo apply \
   --upstream=localhost:3306 \
   --user=root \
   --password=secret \
@@ -164,8 +164,8 @@ mariadb-cow apply \
   --reset
 
 # Apply only a specific database or table
-mariadb-cow apply --upstream=localhost:3306 --user=root --db=mydb
-mariadb-cow apply --upstream=localhost:3306 --user=root --table=users
+moo apply --upstream=localhost:3306 --user=root --db=mydb
+moo apply --upstream=localhost:3306 --user=root --table=users
 ```
 
 | Flag | Description |
@@ -185,19 +185,19 @@ Save and restore named snapshots of the overlay state.
 
 ```bash
 # Save current overlay as a snapshot
-mariadb-cow snapshot before-migration
-mariadb-cow snapshot before-migration --force   # overwrite existing
+moo snapshot before-migration
+moo snapshot before-migration --force   # overwrite existing
 
 # Restore a snapshot
-mariadb-cow restore before-migration
+moo restore before-migration
 
 # List all saved snapshots
-mariadb-cow snapshots
+moo snapshots
 
 # With a custom overlay path
-mariadb-cow snapshot my-snap --overlay=./dev-overlay
-mariadb-cow restore my-snap --overlay=./dev-overlay
-mariadb-cow snapshots --overlay=./dev-overlay
+moo snapshot my-snap --overlay=./dev-overlay
+moo restore my-snap --overlay=./dev-overlay
+moo snapshots --overlay=./dev-overlay
 ```
 
 ### overlay
@@ -206,28 +206,28 @@ Manage named overlays. Each overlay is an independent SQLite layer stored under 
 
 ```bash
 # Create a new empty overlay
-mariadb-cow overlay create feature-x
+moo overlay create feature-x
 
 # List all overlays (active one is marked)
-mariadb-cow overlay list
+moo overlay list
 
 # Show which overlay is currently active
-mariadb-cow overlay active
+moo overlay active
 
 # Switch to a different overlay (restart proxy to take effect)
-mariadb-cow overlay switch feature-x
+moo overlay switch feature-x
 
 # Copy an overlay as the basis for a new one
-mariadb-cow overlay branch feature-x feature-x-v2
+moo overlay branch feature-x feature-x-v2
 
 # Merge source overlay into target (reports conflicts, does not auto-resolve)
-mariadb-cow overlay merge feature-x main
+moo overlay merge feature-x main
 
 # Delete an overlay
-mariadb-cow overlay delete feature-x
+moo overlay delete feature-x
 
 # All overlay commands accept --base to override the overlay directory
-mariadb-cow overlay list --base=./dev-overlay
+moo overlay list --base=./dev-overlay
 ```
 
 ### diff-overlays
@@ -235,11 +235,11 @@ mariadb-cow overlay list --base=./dev-overlay
 Compare two overlay directories, like `git diff branch-a branch-b`.
 
 ```bash
-mariadb-cow diff-overlays ./dev-overlay/feature-x ./dev-overlay/main
+moo diff-overlays ./dev-overlay/feature-x ./dev-overlay/main
 
 # Filter to a specific database or table
-mariadb-cow diff-overlays ./overlay-a ./overlay-b --db=mydb
-mariadb-cow diff-overlays ./overlay-a ./overlay-b --table=users
+moo diff-overlays ./overlay-a ./overlay-b --db=mydb
+moo diff-overlays ./overlay-a ./overlay-b --table=users
 ```
 
 ## Config File
@@ -285,11 +285,11 @@ One SQLite file per database lives under the overlay directory (`./dev-overlay/d
 
 **Session model**
 
-Each client connection gets a dedicated upstream connection. Temporary tables are session-scoped in MariaDB, so isolation between clients is automatic. Multiple `mariadb-cow` instances can point at the same upstream simultaneously.
+Each client connection gets a dedicated upstream connection. Temporary tables are session-scoped in MariaDB, so isolation between clients is automatic. Multiple `moo` instances can point at the same upstream simultaneously.
 
 ```
-Client A  -->  mariadb-cow (:3307)  -->  upstream conn 1  (temp tables for A)
-Client B  -->  mariadb-cow (:3307)  -->  upstream conn 2  (temp tables for B)
+Client A  -->  moo (:3307)  -->  upstream conn 1  (temp tables for A)
+Client B  -->  moo (:3307)  -->  upstream conn 2  (temp tables for B)
 ```
 
 ## Docker
@@ -298,14 +298,14 @@ A multi-stage Dockerfile is included. The final image is based on `debian:bookwo
 
 ```bash
 # Build the image
-docker build -t mariadb-cow .
+docker build -t moo .
 
 # Run the proxy container, pointing at an upstream MariaDB
 docker run -d \
   -p 3307:3307 \
   -v $(pwd)/dev-overlay:/overlay \
   -e UPSTREAM=mydb-host:3306 \
-  mariadb-cow start \
+  moo start \
     --upstream=mydb-host:3306 \
     --listen=0.0.0.0:3307 \
     --overlay=/overlay \
@@ -379,7 +379,7 @@ The integration tests spin up a MariaDB container, run the proxy against it, exe
 ```bash
 # Release build
 cargo build --release
-# Binary: target/release/mariadb-cow
+# Binary: target/release/moo
 
 # Debug build (faster compile, slower runtime)
 cargo build

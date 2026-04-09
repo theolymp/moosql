@@ -305,7 +305,7 @@ async fn seed_database(db_name: &str) -> mysql_async::Pool {
 /// caller-supplied overlay directory.  The process is killed when the
 /// returned `Child` is dropped (`kill_on_drop(true)`).
 async fn start_proxy(overlay_dir: &std::path::Path, proxy_port: u16) -> tokio::process::Child {
-    let binary = std::path::Path::new("./target/debug/mariadb-cow");
+    let binary = std::path::Path::new("./target/debug/moo");
 
     let mut cmd = if binary.exists() {
         let mut c = tokio::process::Command::new(binary);
@@ -1364,7 +1364,7 @@ async fn test_cli_diff_shows_changes() {
     drop(conn);
 
     // Run diff CLI command
-    let output = Command::new("./target/debug/mariadb-cow")
+    let output = Command::new("./target/debug/moo")
         .args([
             "diff",
             &format!("--overlay={}", fix._overlay_dir.path().display()),
@@ -1400,7 +1400,7 @@ async fn test_cli_snapshot_restore() {
     let overlay = fix._overlay_dir.path().display().to_string();
 
     // Take snapshot
-    let snap = Command::new("./target/debug/mariadb-cow")
+    let snap = Command::new("./target/debug/moo")
         .args([
             "snapshot",
             "test-snap",
@@ -1415,13 +1415,13 @@ async fn test_cli_snapshot_restore() {
     );
 
     // Reset overlay
-    let _ = Command::new("./target/debug/mariadb-cow")
+    let _ = Command::new("./target/debug/moo")
         .args(["reset", &format!("--overlay={}", overlay)])
         .output()
         .unwrap();
 
     // Restore snapshot
-    let restore = Command::new("./target/debug/mariadb-cow")
+    let restore = Command::new("./target/debug/moo")
         .args([
             "restore",
             "test-snap",
@@ -1435,7 +1435,7 @@ async fn test_cli_snapshot_restore() {
     // Note: cannot easily verify via proxy since the proxy process holds its own
     // in-memory overlay state, but we can verify the overlay files exist via
     // a CLI tables command if available.
-    let tables_output = Command::new("./target/debug/mariadb-cow")
+    let tables_output = Command::new("./target/debug/moo")
         .args(["tables", &format!("--overlay={}", overlay)])
         .output()
         .unwrap();
@@ -1474,7 +1474,7 @@ async fn test_cli_diff_verbose() {
         .unwrap();
     drop(conn);
 
-    let output = Command::new("./target/debug/mariadb-cow")
+    let output = Command::new("./target/debug/moo")
         .args([
             "diff",
             &format!("--overlay={}", fix._overlay_dir.path().display()),
@@ -1517,7 +1517,7 @@ async fn test_cli_diff_format_sql() {
         .unwrap();
     drop(conn);
 
-    let output = Command::new("./target/debug/mariadb-cow")
+    let output = Command::new("./target/debug/moo")
         .args([
             "diff",
             &format!("--overlay={}", fix._overlay_dir.path().display()),
@@ -1570,7 +1570,7 @@ async fn test_cli_diff_verbose_full() {
         ).unwrap();
     }
 
-    let output = Command::new("./target/debug/mariadb-cow")
+    let output = Command::new("./target/debug/moo")
         .args([
             "diff",
             &format!("--overlay={}", overlay_dir.path().display()),
@@ -1610,7 +1610,7 @@ async fn test_cli_apply_dry_run() {
         .unwrap();
     drop(conn);
 
-    let output = Command::new("./target/debug/mariadb-cow")
+    let output = Command::new("./target/debug/moo")
         .args([
             "apply",
             &format!("--overlay={}/default", fix._overlay_dir.path().display()),
@@ -1659,7 +1659,7 @@ async fn test_cli_apply_commits_to_upstream() {
         .unwrap();
     drop(conn);
 
-    let output = Command::new("./target/debug/mariadb-cow")
+    let output = Command::new("./target/debug/moo")
         .args([
             "apply",
             &format!("--overlay={}/default", fix._overlay_dir.path().display()),
@@ -1711,20 +1711,20 @@ async fn test_cli_snapshot_list() {
     let overlay = fix._overlay_dir.path().display().to_string();
 
     // Take two snapshots
-    let snap1 = Command::new("./target/debug/mariadb-cow")
+    let snap1 = Command::new("./target/debug/moo")
         .args(["snapshot", "snap-alpha", &format!("--overlay={}", overlay)])
         .output()
         .unwrap();
     assert!(snap1.status.success(), "snapshot snap-alpha should succeed");
 
-    let snap2 = Command::new("./target/debug/mariadb-cow")
+    let snap2 = Command::new("./target/debug/moo")
         .args(["snapshot", "snap-beta", &format!("--overlay={}", overlay)])
         .output()
         .unwrap();
     assert!(snap2.status.success(), "snapshot snap-beta should succeed");
 
     // List snapshots
-    let output = Command::new("./target/debug/mariadb-cow")
+    let output = Command::new("./target/debug/moo")
         .args(["snapshots", &format!("--overlay={}", overlay)])
         .output()
         .expect("snapshots command failed");
@@ -1761,7 +1761,7 @@ async fn test_cli_snapshot_force_overwrite() {
     let overlay = fix._overlay_dir.path().display().to_string();
 
     // Take snapshot s1
-    let snap1 = Command::new("./target/debug/mariadb-cow")
+    let snap1 = Command::new("./target/debug/moo")
         .args(["snapshot", "s1", &format!("--overlay={}", overlay)])
         .output()
         .unwrap();
@@ -1777,7 +1777,7 @@ async fn test_cli_snapshot_force_overwrite() {
     drop(conn2);
 
     // Take snapshot s1 again WITHOUT --force (should fail)
-    let snap_no_force = Command::new("./target/debug/mariadb-cow")
+    let snap_no_force = Command::new("./target/debug/moo")
         .args(["snapshot", "s1", &format!("--overlay={}", overlay)])
         .output()
         .unwrap();
@@ -1787,7 +1787,7 @@ async fn test_cli_snapshot_force_overwrite() {
     );
 
     // Take snapshot s1 again WITH --force (should succeed)
-    let snap_force = Command::new("./target/debug/mariadb-cow")
+    let snap_force = Command::new("./target/debug/moo")
         .args([
             "snapshot",
             "s1",
@@ -1809,7 +1809,7 @@ async fn test_cli_snapshot_force_overwrite() {
 async fn test_cli_overlay_lifecycle() {
     let base_dir = tempfile::tempdir().expect("could not create tempdir");
     let base = base_dir.path().display().to_string();
-    let binary = "./target/debug/mariadb-cow";
+    let binary = "./target/debug/moo";
 
     // 1. Create "dev" overlay
     let out = Command::new(binary)
@@ -1906,7 +1906,7 @@ async fn test_cli_overlay_lifecycle() {
 async fn test_cli_overlay_branch() {
     let base_dir = tempfile::tempdir().expect("could not create tempdir");
     let base = base_dir.path().display().to_string();
-    let binary = "./target/debug/mariadb-cow";
+    let binary = "./target/debug/moo";
 
     // Create "main" overlay
     let out = Command::new(binary)
@@ -1951,7 +1951,7 @@ async fn test_cli_overlay_branch() {
 async fn test_cli_overlay_merge() {
     let base_dir = tempfile::tempdir().expect("could not create tempdir");
     let base = base_dir.path().display().to_string();
-    let binary = "./target/debug/mariadb-cow";
+    let binary = "./target/debug/moo";
 
     // Create "main" overlay
     let out = Command::new(binary)
@@ -2043,7 +2043,7 @@ async fn test_cli_diff_overlays() {
     // Create a second empty overlay directory
     let other_dir = tempfile::tempdir().expect("could not create second tempdir");
 
-    let output = Command::new("./target/debug/mariadb-cow")
+    let output = Command::new("./target/debug/moo")
         .args([
             "diff-overlays",
             &fix._overlay_dir.path().display().to_string(),
@@ -2079,7 +2079,7 @@ async fn test_cli_status() {
         .unwrap();
     drop(conn);
 
-    let output = Command::new("./target/debug/mariadb-cow")
+    let output = Command::new("./target/debug/moo")
         .args([
             "status",
             &format!("--overlay={}", fix._overlay_dir.path().display()),
@@ -2117,7 +2117,7 @@ async fn test_cli_reset_clears_overlay() {
     let overlay = fix._overlay_dir.path().display().to_string();
 
     // Reset the overlay
-    let reset_out = Command::new("./target/debug/mariadb-cow")
+    let reset_out = Command::new("./target/debug/moo")
         .args(["reset", &format!("--overlay={}", overlay)])
         .output()
         .expect("reset command failed");
@@ -2128,7 +2128,7 @@ async fn test_cli_reset_clears_overlay() {
     );
 
     // Run diff to verify overlay is clean
-    let diff_out = Command::new("./target/debug/mariadb-cow")
+    let diff_out = Command::new("./target/debug/moo")
         .args(["diff", &format!("--overlay={}", overlay)])
         .output()
         .expect("diff after reset failed");
