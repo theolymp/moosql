@@ -1,5 +1,9 @@
 # moo
 
+[![CI](https://github.com/theolymp/moosql/actions/workflows/ci.yml/badge.svg)](https://github.com/theolymp/moosql/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+
 Copy-on-Write proxy for MariaDB/MySQL — make changes freely, original stays untouched.
 
 ## What it does
