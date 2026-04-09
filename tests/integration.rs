@@ -18,7 +18,7 @@ const UPSTREAM_PORT: u16 = 23306; // non-standard to avoid conflicts
 const CONTAINER_NAME: &str = "mariadb-cow-integration-test";
 
 use std::sync::atomic::{AtomicU16, Ordering};
-static NEXT_PROXY_PORT: AtomicU16 = AtomicU16::new(23307);
+static NEXT_PROXY_PORT: AtomicU16 = AtomicU16::new(30000);
 
 fn next_proxy_port() -> u16 {
     NEXT_PROXY_PORT.fetch_add(1, Ordering::SeqCst)
@@ -340,7 +340,7 @@ async fn start_proxy(overlay_dir: &std::path::Path, proxy_port: u16) -> tokio::p
     }
 
     // Brief pause to allow any previously-bound port to be released by the OS.
-    sleep(Duration::from_millis(1000)).await;
+    sleep(Duration::from_millis(100)).await;
 
     let child = cmd.spawn().expect("failed to spawn proxy process");
 
@@ -1538,23 +1538,42 @@ async fn test_cli_diff_format_sql() {
     );
 }
 
-/// diff --verbose --full: shows old->new column comparison for UPDATEs
+/// diff --verbose --full: shows old->new column comparison for UPDATEs.
+/// Creates overlay data directly in SQLite (no proxy needed) and then
+/// runs the diff CLI with --full pointing at the upstream MariaDB.
 #[tokio::test]
 #[ignore]
 async fn test_cli_diff_verbose_full() {
-    let fix = Fixture::new().await;
-    let proxy = fix.proxy_pool();
-    let mut conn = proxy.get_conn().await.unwrap();
+    // Ensure MariaDB is running (reuses existing container).
+    let _ = start_mariadb().await;
+    let db_name = unique_db_name();
+    let upstream = seed_database(&db_name).await;
 
-    conn.query_drop("UPDATE users SET email = 'alice_new@test.com' WHERE name = 'Alice'")
-        .await
-        .unwrap();
-    drop(conn);
+    // Create overlay directly via SQLite — simulate an UPDATE to Alice's email.
+    let overlay_dir = tempfile::tempdir().expect("could not create tempdir");
+    {
+        let db_path = overlay_dir.path().join(format!("{db_name}.db"));
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS _cow_tables (
+                 table_name TEXT PRIMARY KEY, has_schema INTEGER DEFAULT 0,
+                 has_data INTEGER DEFAULT 0, base_schema TEXT,
+                 overlay_schema TEXT, truncated INTEGER DEFAULT 0);
+             CREATE TABLE IF NOT EXISTS _cow_sequences (
+                 table_name TEXT PRIMARY KEY, next_value INTEGER DEFAULT 9223372036854775807);
+             INSERT INTO _cow_tables (table_name, has_data) VALUES ('users', 1);
+             CREATE TABLE _cow_data_users (
+                 _cow_pk TEXT NOT NULL, _cow_op TEXT NOT NULL,
+                 id TEXT, name TEXT, email TEXT, active TEXT);
+             INSERT INTO _cow_data_users VALUES ('1', 'UPDATE', '1', 'Alice', 'alice_new@test.com', '1');",
+        ).unwrap();
+    }
 
     let output = Command::new("./target/debug/mariadb-cow")
         .args([
             "diff",
-            &format!("--overlay={}", fix._overlay_dir.path().display()),
+            &format!("--overlay={}", overlay_dir.path().display()),
             "--verbose",
             "--full",
             &format!("--upstream=127.0.0.1:{}", UPSTREAM_PORT),
@@ -1570,11 +1589,12 @@ async fn test_cli_diff_verbose_full() {
         output.status.success(),
         "diff --verbose --full should succeed.\nstdout: {stdout}\nstderr: {stderr}"
     );
-    // Full diff should show the old and new values for the UPDATE
     assert!(
         stdout.contains("->") || stdout.contains("alice") || stdout.contains("Alice"),
         "diff --verbose --full should show old->new values.\nstdout: {stdout}\nstderr: {stderr}"
     );
+
+    drop(upstream);
 }
 
 /// apply --dry-run: prints SQL without executing

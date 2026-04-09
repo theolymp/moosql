@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use opensrv_mysql::AsyncMysqlIntermediary;
-use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use super::handler::CowHandler;
@@ -39,7 +38,13 @@ impl ProxyServer {
     }
 
     pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(&self.listen_addr).await?;
+        let addr: std::net::SocketAddr = self.listen_addr.parse()
+            .or_else(|_| format!("{}:3307", self.listen_addr).parse())
+            .map_err(|e| anyhow::anyhow!("Invalid listen address '{}': {}", self.listen_addr, e))?;
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.set_reuseaddr(true)?;
+        socket.bind(addr)?;
+        let listener = socket.listen(128)?;
         info!(
             listen = %self.listen_addr,
             upstream = %self.upstream_addr,
