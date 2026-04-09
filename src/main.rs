@@ -107,8 +107,9 @@ async fn main() -> Result<()> {
                 "sql" => cli::diff::DiffFormat::Sql,
                 _ => cli::diff::DiffFormat::Text,
             };
+            let resolved = cli::overlay_mgmt::resolve_overlay_dir(&args.overlay);
             cli::diff::run_diff(
-                &args.overlay,
+                &resolved,
                 format,
                 args.verbose,
                 args.full,

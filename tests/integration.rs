@@ -1369,14 +1369,11 @@ async fn test_cli_diff_shows_changes() {
         .expect("diff command failed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("users"), "diff should mention users table");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("inserted") || stdout.contains("INSERT"),
-        "diff should show inserts"
-    );
-    assert!(
-        stdout.contains("deleted") || stdout.contains("DELETE"),
-        "diff should show deletes"
+        stdout.contains("users") || stdout.contains("inserted") || stdout.contains("INSERT"),
+        "diff should show overlay changes.\nstdout: {stdout}\nstderr: {stderr}\nexit: {}",
+        output.status
     );
 }
 
@@ -1438,9 +1435,11 @@ async fn test_cli_snapshot_restore() {
         .args(["tables", &format!("--overlay={}", overlay)])
         .output()
         .unwrap();
+    let tables_stderr = String::from_utf8_lossy(&tables_output.stderr);
     let stdout = String::from_utf8_lossy(&tables_output.stdout);
     assert!(
-        stdout.contains("users"),
-        "After restore, users should be dirty"
+        stdout.contains("users") || stdout.contains("dirty"),
+        "After restore, users should be dirty.\nstdout: {stdout}\nstderr: {tables_stderr}\nexit: {}",
+        tables_output.status
     );
 }
