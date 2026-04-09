@@ -214,6 +214,73 @@ async fn seed_database(db_name: &str) -> mysql_async::Pool {
     .await
     .expect("INSERT employees failed");
 
+    // FK tables for constraint testing.
+    conn.query_drop(
+        "CREATE TABLE departments (
+            id   INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100) NOT NULL
+        )",
+    )
+    .await
+    .expect("CREATE TABLE departments failed");
+
+    conn.query_drop(
+        "INSERT INTO departments (name) VALUES ('Engineering'), ('Sales')",
+    )
+    .await
+    .expect("INSERT departments failed");
+
+    conn.query_drop(
+        "CREATE TABLE staff (
+            id      INT AUTO_INCREMENT PRIMARY KEY,
+            name    VARCHAR(100) NOT NULL,
+            dept_id INT,
+            FOREIGN KEY (dept_id) REFERENCES departments(id) ON DELETE RESTRICT
+        )",
+    )
+    .await
+    .expect("CREATE TABLE staff failed");
+
+    conn.query_drop(
+        "INSERT INTO staff (name, dept_id) VALUES ('Alice', 1), ('Bob', 2), ('Charlie', 1)",
+    )
+    .await
+    .expect("INSERT staff failed");
+
+    conn.query_drop(
+        "CREATE TABLE tasks (
+            id          INT AUTO_INCREMENT PRIMARY KEY,
+            title       VARCHAR(200) NOT NULL,
+            assigned_to INT,
+            FOREIGN KEY (assigned_to) REFERENCES staff(id) ON DELETE SET NULL
+        )",
+    )
+    .await
+    .expect("CREATE TABLE tasks failed");
+
+    conn.query_drop(
+        "INSERT INTO tasks (title, assigned_to) VALUES ('Build proxy', 1), ('Write docs', 2), ('Review PR', 3)",
+    )
+    .await
+    .expect("INSERT tasks failed");
+
+    conn.query_drop(
+        "CREATE TABLE audit_log (
+            id       INT AUTO_INCREMENT PRIMARY KEY,
+            staff_id INT NOT NULL,
+            action   VARCHAR(100),
+            FOREIGN KEY (staff_id) REFERENCES staff(id) ON DELETE CASCADE
+        )",
+    )
+    .await
+    .expect("CREATE TABLE audit_log failed");
+
+    conn.query_drop(
+        "INSERT INTO audit_log (staff_id, action) VALUES (1, 'login'), (1, 'deploy'), (2, 'login'), (3, 'review')",
+    )
+    .await
+    .expect("INSERT audit_log failed");
+
     // A stored procedure for SP rewriting tests.
     conn.query_drop(
         "DROP PROCEDURE IF EXISTS get_user_by_id",
@@ -963,4 +1030,417 @@ async fn test_stored_procedure_rewriting() {
     // NOTE: SP rewriting (injecting overlay deltas into SP body execution) is
     // not yet supported — overlay updates made before CALL are not visible
     // inside the SP result.
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FK Constraint Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// FK RESTRICT: deleting a department that has staff should fail.
+#[tokio::test]
+#[ignore]
+async fn test_fk_restrict_blocks_delete() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Try to delete Engineering department — has staff referencing it
+    let result = conn
+        .query_drop("DELETE FROM departments WHERE id = 1")
+        .await;
+    assert!(result.is_err(), "DELETE should fail due to FK RESTRICT");
+
+    // Department should still exist through proxy
+    let dept: Option<String> = conn
+        .query_first("SELECT name FROM departments WHERE id = 1")
+        .await
+        .unwrap();
+    assert_eq!(dept.as_deref(), Some("Engineering"));
+}
+
+/// FK CASCADE: deleting a staff member should cascade-delete their audit_log entries.
+#[tokio::test]
+#[ignore]
+async fn test_fk_cascade_delete() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Count Alice's audit entries before delete
+    let before: Vec<(i64,)> = conn
+        .query("SELECT COUNT(*) FROM audit_log WHERE staff_id = 1")
+        .await
+        .unwrap();
+    assert!(before[0].0 > 0, "Alice should have audit entries");
+
+    // Delete Alice — should cascade to audit_log
+    conn.query_drop("DELETE FROM staff WHERE id = 1")
+        .await
+        .unwrap();
+
+    // Alice's audit entries should be gone through proxy
+    let after: Vec<(i64,)> = conn
+        .query("SELECT COUNT(*) FROM audit_log WHERE staff_id = 1")
+        .await
+        .unwrap();
+    assert_eq!(after[0].0, 0, "Audit entries should be cascade-deleted");
+
+    // Base DB should be untouched
+    let mut up = fix.upstream.get_conn().await.unwrap();
+    let base_count: Option<i64> = up
+        .query_first("SELECT COUNT(*) FROM audit_log WHERE staff_id = 1")
+        .await
+        .unwrap();
+    assert!(
+        base_count.unwrap() > 0,
+        "Base DB audit entries should still exist"
+    );
+}
+
+/// FK SET NULL: deleting a staff member should set tasks.assigned_to to NULL.
+#[tokio::test]
+#[ignore]
+async fn test_fk_set_null() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Delete Bob (id=2) — tasks assigned to Bob should get assigned_to = NULL
+    conn.query_drop("DELETE FROM staff WHERE id = 2")
+        .await
+        .unwrap();
+
+    // Check Bob's task through proxy — assigned_to should be NULL
+    let row: Vec<(Option<i32>,)> = conn
+        .query("SELECT assigned_to FROM tasks WHERE title = 'Write docs'")
+        .await
+        .unwrap();
+    assert_eq!(row.len(), 1, "Task should exist");
+    assert_eq!(
+        row[0].0, None,
+        "assigned_to should be NULL after FK SET NULL"
+    );
+
+    // Base should be untouched
+    let mut up = fix.upstream.get_conn().await.unwrap();
+    let base_assigned: Option<i32> = up
+        .query_first("SELECT assigned_to FROM tasks WHERE title = 'Write docs'")
+        .await
+        .unwrap();
+    assert_eq!(
+        base_assigned,
+        Some(2),
+        "Base should still have Bob assigned"
+    );
+}
+
+/// FK: INSERT with invalid FK reference should fail.
+#[tokio::test]
+#[ignore]
+async fn test_fk_insert_invalid_reference() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Insert staff with non-existent department — should ideally fail.
+    // Note: this may succeed in current implementation since FK checks
+    // for INSERTs are not yet enforced in the overlay. Test documents behavior.
+    let result = conn
+        .query_drop("INSERT INTO staff (name, dept_id) VALUES ('Ghost', 999)")
+        .await;
+    // Document current behavior — may be Ok (known limitation) or Err (if enforced)
+    if result.is_ok() {
+        // Known limitation: INSERT FK validation not yet implemented in overlay
+    }
+}
+
+/// FK CASCADE chain: delete triggers cascade on audit_log AND set-null on tasks.
+#[tokio::test]
+#[ignore]
+async fn test_fk_cascade_chain() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Delete Alice (staff id=1)
+    // This should: cascade-delete audit_log entries for Alice
+    // AND: set tasks.assigned_to = NULL for Alice's tasks
+    conn.query_drop("DELETE FROM staff WHERE id = 1")
+        .await
+        .unwrap();
+
+    // Verify cascade: no more audit entries for Alice
+    let audit_count: Option<i64> = conn
+        .query_first("SELECT COUNT(*) FROM audit_log WHERE staff_id = 1")
+        .await
+        .unwrap();
+    assert_eq!(audit_count, Some(0));
+
+    // Verify set null: Alice's task should have NULL assigned_to
+    let task_assigned: Vec<(String, Option<i32>)> = conn
+        .query(
+            "SELECT title, assigned_to FROM tasks WHERE title = 'Build proxy'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(task_assigned.len(), 1);
+    assert_eq!(
+        task_assigned[0].1, None,
+        "assigned_to should be NULL after FK SET NULL"
+    );
+
+    // Base completely untouched
+    let mut up = fix.upstream.get_conn().await.unwrap();
+    let base_audit: Option<i64> = up
+        .query_first("SELECT COUNT(*) FROM audit_log WHERE staff_id = 1")
+        .await
+        .unwrap();
+    assert!(base_audit.unwrap() > 0, "Base audit_log untouched");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Real-World Scenario Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Real-world: E-commerce order flow through overlay.
+#[tokio::test]
+#[ignore]
+async fn test_realworld_ecommerce_flow() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // 1. Add a new product
+    conn.query_drop(
+        "INSERT INTO products (name, category_id, price) VALUES ('Headphones', 1, 49.99)",
+    )
+    .await
+    .unwrap();
+
+    // 2. Update existing product price
+    conn.query_drop("UPDATE products SET price = 7.99 WHERE name = 'Widget'")
+        .await
+        .unwrap();
+
+    // 3. Delete discontinued product
+    conn.query_drop("DELETE FROM products WHERE name = 'Cable'")
+        .await
+        .unwrap();
+
+    // 4. Verify through complex query
+    let products: Vec<(String, String)> = conn
+        .query(
+            "SELECT p.name, c.name FROM products p \
+             JOIN categories c ON p.category_id = c.id \
+             ORDER BY p.price",
+        )
+        .await
+        .unwrap();
+
+    // Should see: Widget(7.99), Gadget(19.99), Headphones(49.99) — Cable gone
+    assert_eq!(products.len(), 3);
+    assert!(products.iter().any(|(name, _)| name == "Headphones"));
+    assert!(!products.iter().any(|(name, _)| name == "Cable"));
+
+    // 5. Base DB completely unchanged
+    let mut up = fix.upstream.get_conn().await.unwrap();
+    let base_products: Vec<String> = up
+        .query("SELECT name FROM products ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(base_products, vec!["Cable", "Gadget", "Widget"]);
+}
+
+/// Real-world: Multiple writes then complex reporting query.
+#[tokio::test]
+#[ignore]
+async fn test_realworld_reporting_query() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Make several changes
+    conn.query_drop(
+        "INSERT INTO users (name, email) VALUES ('Dave', 'dave@test.com')",
+    )
+    .await
+    .unwrap();
+    conn.query_drop(
+        "INSERT INTO orders (user_id, product) VALUES (1, 'Premium Widget')",
+    )
+    .await
+    .unwrap();
+    conn.query_drop("DELETE FROM users WHERE name = 'Bob'")
+        .await
+        .unwrap();
+
+    // Complex reporting: users with their order counts (overlay-aware)
+    let report: Vec<(String, i64)> = conn
+        .query(
+            "SELECT u.name, COUNT(o.id) as order_count \
+             FROM users u \
+             LEFT JOIN orders o ON o.user_id = u.id \
+             GROUP BY u.id, u.name \
+             ORDER BY order_count DESC",
+        )
+        .await
+        .unwrap();
+
+    // Alice: 2 orders (Widget + Premium Widget), Dave: 0, Bob: gone
+    assert!(report.len() >= 2);
+    assert!(report.iter().any(|(name, _)| name == "Alice"));
+    assert!(report.iter().any(|(name, _)| name == "Dave"));
+    assert!(!report.iter().any(|(name, _)| name == "Bob"));
+}
+
+/// Real-world: Transaction-like behavior (batch update, then verify).
+#[tokio::test]
+#[ignore]
+async fn test_realworld_batch_updates() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Batch update all emails to new domain
+    conn.query_drop(
+        "UPDATE users SET email = REPLACE(email, '@test.com', '@newdomain.com')",
+    )
+    .await
+    .unwrap();
+
+    // Verify all emails changed
+    let emails: Vec<String> = conn
+        .query("SELECT email FROM users ORDER BY id")
+        .await
+        .unwrap();
+    for email in &emails {
+        assert!(
+            email.contains("@newdomain.com"),
+            "Email should be updated: {}",
+            email
+        );
+    }
+
+    // Base unchanged
+    let mut up = fix.upstream.get_conn().await.unwrap();
+    let base_emails: Vec<String> = up
+        .query("SELECT email FROM users ORDER BY id")
+        .await
+        .unwrap();
+    for email in &base_emails {
+        assert!(
+            email.contains("@test.com"),
+            "Base email should be original: {}",
+            email
+        );
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CLI Feature Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// CLI: diff command shows overlay changes.
+#[tokio::test]
+#[ignore]
+async fn test_cli_diff_shows_changes() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Make changes
+    conn.query_drop(
+        "INSERT INTO users (name, email) VALUES ('DiffUser', 'diff@test.com')",
+    )
+    .await
+    .unwrap();
+    conn.query_drop("DELETE FROM users WHERE name = 'Bob'")
+        .await
+        .unwrap();
+    drop(conn);
+
+    // Run diff CLI command
+    let output = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "diff",
+            &format!("--overlay={}", fix._overlay_dir.path().display()),
+        ])
+        .output()
+        .expect("diff command failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("users"), "diff should mention users table");
+    assert!(
+        stdout.contains("inserted") || stdout.contains("INSERT"),
+        "diff should show inserts"
+    );
+    assert!(
+        stdout.contains("deleted") || stdout.contains("DELETE"),
+        "diff should show deletes"
+    );
+}
+
+/// CLI: snapshot and restore preserves overlay state.
+#[tokio::test]
+#[ignore]
+async fn test_cli_snapshot_restore() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Make a change
+    conn.query_drop(
+        "INSERT INTO users (name, email) VALUES ('SnapUser', 'snap@test.com')",
+    )
+    .await
+    .unwrap();
+    drop(conn);
+
+    let overlay = fix._overlay_dir.path().display().to_string();
+
+    // Take snapshot
+    let snap = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "snapshot",
+            "test-snap",
+            &format!("--overlay={}", overlay),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        snap.status.success(),
+        "snapshot should succeed: {}",
+        String::from_utf8_lossy(&snap.stderr)
+    );
+
+    // Reset overlay
+    let _ = Command::new("./target/debug/mariadb-cow")
+        .args(["reset", &format!("--overlay={}", overlay)])
+        .output()
+        .unwrap();
+
+    // Restore snapshot
+    let restore = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "restore",
+            "test-snap",
+            &format!("--overlay={}", overlay),
+        ])
+        .output()
+        .unwrap();
+    assert!(restore.status.success(), "restore should succeed");
+
+    // Verify: overlay files should be restored (users table should be dirty).
+    // Note: cannot easily verify via proxy since the proxy process holds its own
+    // in-memory overlay state, but we can verify the overlay files exist via
+    // a CLI tables command if available.
+    let tables_output = Command::new("./target/debug/mariadb-cow")
+        .args(["tables", &format!("--overlay={}", overlay)])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&tables_output.stdout);
+    assert!(
+        stdout.contains("users"),
+        "After restore, users should be dirty"
+    );
 }
