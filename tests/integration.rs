@@ -1443,3 +1443,659 @@ async fn test_cli_snapshot_restore() {
         tables_output.status
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CLI Feature Integration Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// diff --verbose: shows individual row changes (INSERT/UPDATE/DELETE lines)
+#[tokio::test]
+#[ignore]
+async fn test_cli_diff_verbose() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // INSERT a new row
+    conn.query_drop("INSERT INTO users (name, email) VALUES ('VerboseUser', 'verbose@test.com')")
+        .await
+        .unwrap();
+    // UPDATE an existing row
+    conn.query_drop("UPDATE users SET email = 'alice_updated@test.com' WHERE name = 'Alice'")
+        .await
+        .unwrap();
+    // DELETE an existing row
+    conn.query_drop("DELETE FROM users WHERE name = 'Bob'")
+        .await
+        .unwrap();
+    drop(conn);
+
+    let output = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "diff",
+            &format!("--overlay={}", fix._overlay_dir.path().display()),
+            "--verbose",
+        ])
+        .output()
+        .expect("diff --verbose command failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "diff --verbose should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    // Verbose output should show individual row-level change markers
+    assert!(
+        stdout.contains("INSERT") || stdout.contains("+") || stdout.contains("insert"),
+        "diff --verbose should show INSERT lines.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("UPDATE") || stdout.contains("~") || stdout.contains("update"),
+        "diff --verbose should show UPDATE lines.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("DELETE") || stdout.contains("-") || stdout.contains("delete"),
+        "diff --verbose should show DELETE lines.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// diff --format=sql: generates executable SQL statements
+#[tokio::test]
+#[ignore]
+async fn test_cli_diff_format_sql() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop("INSERT INTO users (name, email) VALUES ('SqlUser', 'sql@test.com')")
+        .await
+        .unwrap();
+    drop(conn);
+
+    let output = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "diff",
+            &format!("--overlay={}", fix._overlay_dir.path().display()),
+            "--format=sql",
+        ])
+        .output()
+        .expect("diff --format=sql command failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "diff --format=sql should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("INSERT INTO") || stdout.contains("insert into"),
+        "diff --format=sql should contain INSERT INTO statement.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// diff --verbose --full: shows old->new column comparison for UPDATEs
+#[tokio::test]
+#[ignore]
+async fn test_cli_diff_verbose_full() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop("UPDATE users SET email = 'alice_new@test.com' WHERE name = 'Alice'")
+        .await
+        .unwrap();
+    drop(conn);
+
+    let output = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "diff",
+            &format!("--overlay={}", fix._overlay_dir.path().display()),
+            "--verbose",
+            "--full",
+            &format!("--upstream=127.0.0.1:{}", UPSTREAM_PORT),
+            "--user=root",
+            "--password=testpass",
+        ])
+        .output()
+        .expect("diff --verbose --full command failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "diff --verbose --full should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    // Full diff should show the old and new values for the UPDATE
+    assert!(
+        stdout.contains("->") || stdout.contains("alice") || stdout.contains("Alice"),
+        "diff --verbose --full should show old->new values.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// apply --dry-run: prints SQL without executing
+#[tokio::test]
+#[ignore]
+async fn test_cli_apply_dry_run() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop("INSERT INTO users (name, email) VALUES ('DryRunUser', 'dryrun@test.com')")
+        .await
+        .unwrap();
+    drop(conn);
+
+    let output = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "apply",
+            &format!("--overlay={}", fix._overlay_dir.path().display()),
+            &format!("--upstream=127.0.0.1:{}", UPSTREAM_PORT),
+            "--user=root",
+            "--password=testpass",
+            "--dry-run",
+        ])
+        .output()
+        .expect("apply --dry-run command failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "apply --dry-run should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    // Dry-run should print SQL
+    assert!(
+        stdout.contains("INSERT") || stdout.contains("insert") || stdout.contains("DryRunUser"),
+        "apply --dry-run should show SQL.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Verify upstream was NOT modified
+    let mut upstream_conn = fix.upstream.get_conn().await.unwrap();
+    let rows: Vec<String> = upstream_conn
+        .query("SELECT name FROM users WHERE name = 'DryRunUser'")
+        .await
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "apply --dry-run should NOT modify upstream, but found DryRunUser"
+    );
+}
+
+/// apply --yes: actually writes overlay changes to upstream
+#[tokio::test]
+#[ignore]
+async fn test_cli_apply_commits_to_upstream() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop("INSERT INTO users (name, email) VALUES ('ApplyUser', 'apply@test.com')")
+        .await
+        .unwrap();
+    drop(conn);
+
+    let output = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "apply",
+            &format!("--overlay={}", fix._overlay_dir.path().display()),
+            &format!("--upstream=127.0.0.1:{}", UPSTREAM_PORT),
+            "--user=root",
+            "--password=testpass",
+            "--yes",
+        ])
+        .output()
+        .expect("apply --yes command failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "apply --yes should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Verify upstream WAS modified
+    let mut upstream_conn = fix.upstream.get_conn().await.unwrap();
+    let rows: Vec<String> = upstream_conn
+        .query("SELECT name FROM users WHERE name = 'ApplyUser'")
+        .await
+        .unwrap();
+    assert!(
+        !rows.is_empty(),
+        "apply --yes should write ApplyUser to upstream"
+    );
+}
+
+/// snapshot list: shows saved snapshots with name and date
+#[tokio::test]
+#[ignore]
+async fn test_cli_snapshot_list() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop("INSERT INTO users (name, email) VALUES ('SnapListUser', 'snaplist@test.com')")
+        .await
+        .unwrap();
+    drop(conn);
+
+    let overlay = fix._overlay_dir.path().display().to_string();
+
+    // Take two snapshots
+    let snap1 = Command::new("./target/debug/mariadb-cow")
+        .args(["snapshot", "snap-alpha", &format!("--overlay={}", overlay)])
+        .output()
+        .unwrap();
+    assert!(snap1.status.success(), "snapshot snap-alpha should succeed");
+
+    let snap2 = Command::new("./target/debug/mariadb-cow")
+        .args(["snapshot", "snap-beta", &format!("--overlay={}", overlay)])
+        .output()
+        .unwrap();
+    assert!(snap2.status.success(), "snapshot snap-beta should succeed");
+
+    // List snapshots
+    let output = Command::new("./target/debug/mariadb-cow")
+        .args(["snapshots", &format!("--overlay={}", overlay)])
+        .output()
+        .expect("snapshots command failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "snapshots should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("snap-alpha"),
+        "snapshots should list snap-alpha.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("snap-beta"),
+        "snapshots should list snap-beta.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// snapshot --force: overwrites existing snapshot
+#[tokio::test]
+#[ignore]
+async fn test_cli_snapshot_force_overwrite() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop("INSERT INTO users (name, email) VALUES ('ForceUser1', 'force1@test.com')")
+        .await
+        .unwrap();
+    drop(conn);
+
+    let overlay = fix._overlay_dir.path().display().to_string();
+
+    // Take snapshot s1
+    let snap1 = Command::new("./target/debug/mariadb-cow")
+        .args(["snapshot", "s1", &format!("--overlay={}", overlay)])
+        .output()
+        .unwrap();
+    assert!(snap1.status.success(), "first snapshot s1 should succeed");
+
+    // Make more changes
+    let proxy_pool = fix.proxy_pool();
+    let mut conn2 = proxy_pool.get_conn().await.unwrap();
+    conn2
+        .query_drop("INSERT INTO users (name, email) VALUES ('ForceUser2', 'force2@test.com')")
+        .await
+        .unwrap();
+    drop(conn2);
+
+    // Take snapshot s1 again WITHOUT --force (should fail)
+    let snap_no_force = Command::new("./target/debug/mariadb-cow")
+        .args(["snapshot", "s1", &format!("--overlay={}", overlay)])
+        .output()
+        .unwrap();
+    assert!(
+        !snap_no_force.status.success(),
+        "snapshot s1 without --force should fail when it already exists"
+    );
+
+    // Take snapshot s1 again WITH --force (should succeed)
+    let snap_force = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "snapshot",
+            "s1",
+            &format!("--overlay={}", overlay),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&snap_force.stderr);
+    assert!(
+        snap_force.status.success(),
+        "snapshot s1 --force should succeed.\nstderr: {stderr}"
+    );
+}
+
+/// overlay create/list/switch/active/delete: full multi-overlay workflow
+#[tokio::test]
+#[ignore]
+async fn test_cli_overlay_lifecycle() {
+    let base_dir = tempfile::tempdir().expect("could not create tempdir");
+    let base = base_dir.path().display().to_string();
+    let binary = "./target/debug/mariadb-cow";
+
+    // 1. Create "dev" overlay
+    let out = Command::new(binary)
+        .args(["overlay", "create", "dev", &format!("--base={}", base)])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "overlay create dev should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 2. Create "staging" overlay
+    let out = Command::new(binary)
+        .args(["overlay", "create", "staging", &format!("--base={}", base)])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "overlay create staging should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 3. List overlays -> shows dev, staging
+    let out = Command::new(binary)
+        .args(["overlay", "list", &format!("--base={}", base)])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "overlay list should succeed");
+    assert!(
+        stdout.contains("dev"),
+        "overlay list should show dev.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("staging"),
+        "overlay list should show staging.\nstdout: {stdout}"
+    );
+
+    // 4. Switch to "staging"
+    let out = Command::new(binary)
+        .args(["overlay", "switch", "staging", &format!("--base={}", base)])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "overlay switch staging should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 5. Active overlay should be "staging"
+    let out = Command::new(binary)
+        .args(["overlay", "active", &format!("--base={}", base)])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "overlay active should succeed");
+    assert!(
+        stdout.contains("staging"),
+        "overlay active should show staging.\nstdout: {stdout}"
+    );
+
+    // 6. Delete "dev"
+    let out = Command::new(binary)
+        .args(["overlay", "delete", "dev", &format!("--base={}", base)])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "overlay delete dev should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 7. List -> only "staging"
+    let out = Command::new(binary)
+        .args(["overlay", "list", &format!("--base={}", base)])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "overlay list should succeed");
+    assert!(
+        !stdout.contains("dev"),
+        "overlay list should NOT show dev after delete.\nstdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("staging"),
+        "overlay list should still show staging.\nstdout: {stdout}"
+    );
+}
+
+/// overlay branch: creates a copy of an overlay
+#[tokio::test]
+#[ignore]
+async fn test_cli_overlay_branch() {
+    let base_dir = tempfile::tempdir().expect("could not create tempdir");
+    let base = base_dir.path().display().to_string();
+    let binary = "./target/debug/mariadb-cow";
+
+    // Create "main" overlay
+    let out = Command::new(binary)
+        .args(["overlay", "create", "main", &format!("--base={}", base)])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "overlay create main should succeed");
+
+    // Put a marker file in the main overlay directory so we can verify the copy
+    let main_dir = base_dir.path().join("main");
+    std::fs::write(main_dir.join("marker.db"), b"test data").expect("write marker file");
+
+    // Branch "main" -> "feature-x"
+    let out = Command::new(binary)
+        .args([
+            "overlay",
+            "branch",
+            "main",
+            "feature-x",
+            &format!("--base={}", base),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "overlay branch should succeed.\nstderr: {stderr}"
+    );
+
+    // Verify feature-x directory exists with the same marker file
+    let feature_dir = base_dir.path().join("feature-x");
+    assert!(feature_dir.exists(), "feature-x directory should exist");
+    assert!(
+        feature_dir.join("marker.db").exists(),
+        "feature-x should contain marker.db copied from main"
+    );
+}
+
+/// overlay merge: merges non-conflicting changes
+#[tokio::test]
+#[ignore]
+async fn test_cli_overlay_merge() {
+    let base_dir = tempfile::tempdir().expect("could not create tempdir");
+    let base = base_dir.path().display().to_string();
+    let binary = "./target/debug/mariadb-cow";
+
+    // Create "main" overlay
+    let out = Command::new(binary)
+        .args(["overlay", "create", "main", &format!("--base={}", base)])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "overlay create main should succeed");
+
+    // Branch "main" -> "feature"
+    let out = Command::new(binary)
+        .args([
+            "overlay",
+            "branch",
+            "main",
+            "feature",
+            &format!("--base={}", base),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "overlay branch should succeed");
+
+    // Add different .db files to each overlay to simulate non-conflicting changes
+    let main_dir = base_dir.path().join("main");
+    let feature_dir = base_dir.path().join("feature");
+    std::fs::write(main_dir.join("table_a.db"), b"main data").expect("write main table");
+    std::fs::write(feature_dir.join("table_b.db"), b"feature data").expect("write feature table");
+
+    // Merge "feature" into "main"
+    let out = Command::new(binary)
+        .args([
+            "overlay",
+            "merge",
+            "feature",
+            "main",
+            &format!("--base={}", base),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "overlay merge should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // After merge, "main" should have both table files
+    assert!(
+        main_dir.join("table_a.db").exists(),
+        "main should still have table_a.db"
+    );
+    assert!(
+        main_dir.join("table_b.db").exists(),
+        "main should have table_b.db from feature after merge"
+    );
+}
+
+/// diff-overlays: shows differences between two overlay directories
+#[tokio::test]
+#[ignore]
+async fn test_cli_diff_overlays() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    // Make changes to create overlay data
+    conn.query_drop("INSERT INTO users (name, email) VALUES ('DiffOvUser', 'diffov@test.com')")
+        .await
+        .unwrap();
+    drop(conn);
+
+    // Create a second empty overlay directory
+    let other_dir = tempfile::tempdir().expect("could not create second tempdir");
+
+    let output = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "diff-overlays",
+            &fix._overlay_dir.path().display().to_string(),
+            &other_dir.path().display().to_string(),
+        ])
+        .output()
+        .expect("diff-overlays command failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "diff-overlays should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    // The two overlays are different (one has changes, one is empty),
+    // so diff-overlays should report something
+    assert!(
+        !stdout.is_empty() || !stderr.is_empty(),
+        "diff-overlays should produce output when overlays differ"
+    );
+}
+
+/// status: shows overlay summary
+#[tokio::test]
+#[ignore]
+async fn test_cli_status() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop("INSERT INTO users (name, email) VALUES ('StatusUser', 'status@test.com')")
+        .await
+        .unwrap();
+    drop(conn);
+
+    let output = Command::new("./target/debug/mariadb-cow")
+        .args([
+            "status",
+            &format!("--overlay={}", fix._overlay_dir.path().display()),
+        ])
+        .output()
+        .expect("status command failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "status should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    // Status should mention dirty tables or table count
+    assert!(
+        stdout.contains("users") || stdout.contains("dirty") || stdout.contains("table")
+            || stdout.contains("changed") || stdout.contains("modified"),
+        "status should show dirty table info.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// reset then diff: overlay should be empty after reset
+#[tokio::test]
+#[ignore]
+async fn test_cli_reset_clears_overlay() {
+    let fix = Fixture::new().await;
+    let proxy = fix.proxy_pool();
+    let mut conn = proxy.get_conn().await.unwrap();
+
+    conn.query_drop("INSERT INTO users (name, email) VALUES ('ResetUser', 'reset@test.com')")
+        .await
+        .unwrap();
+    drop(conn);
+
+    let overlay = fix._overlay_dir.path().display().to_string();
+
+    // Reset the overlay
+    let reset_out = Command::new("./target/debug/mariadb-cow")
+        .args(["reset", &format!("--overlay={}", overlay)])
+        .output()
+        .expect("reset command failed");
+    assert!(
+        reset_out.status.success(),
+        "reset should succeed: {}",
+        String::from_utf8_lossy(&reset_out.stderr)
+    );
+
+    // Run diff to verify overlay is clean
+    let diff_out = Command::new("./target/debug/mariadb-cow")
+        .args(["diff", &format!("--overlay={}", overlay)])
+        .output()
+        .expect("diff after reset failed");
+
+    let stdout = String::from_utf8_lossy(&diff_out.stdout);
+    let stderr = String::from_utf8_lossy(&diff_out.stderr);
+    assert!(
+        diff_out.status.success(),
+        "diff after reset should succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    // After reset, diff should show no changes
+    assert!(
+        stdout.contains("No changes") || stdout.contains("no changes") || stdout.contains("clean")
+            || stdout.trim().is_empty(),
+        "diff after reset should show no changes.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
