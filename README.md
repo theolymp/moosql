@@ -4,22 +4,22 @@ Copy-on-Write proxy for MariaDB/MySQL — make changes freely, original stays un
 
 ## What it does
 
-`moo` sits in front of any MariaDB/MySQL database and intercepts every query. All writes (INSERT, UPDATE, DELETE, DDL) are redirected to a local SQLite overlay — the upstream database is never modified. When a SELECT touches a table that has overlay data, the proxy rewrites the query to merge the base and overlay results via temporary-table injection, so the client sees a consistent merged view. When you are done, run `moo reset` and the overlay is gone, leaving the upstream exactly as it was.
+`mariadb-cow` sits in front of any MariaDB/MySQL database and intercepts every query. All writes (INSERT, UPDATE, DELETE, DDL) are redirected to a local SQLite overlay — the upstream database is never modified. When a SELECT touches a table that has overlay data, the proxy rewrites the query to merge the base and overlay results via temporary-table injection, so the client sees a consistent merged view.
 
-Think of it as OverlayFS for databases: read from the real database, write to a local layer, reads see both merged transparently.
+Think of it as OverlayFS for databases: reads come from the real database, writes go to a local layer, and clients see both merged transparently. When you are done experimenting, run `mariadb-cow reset` and the overlay is gone, leaving the upstream exactly as it was. Or run `mariadb-cow apply` to write the overlay changes back into the upstream.
 
 ## Quick Start
 
 ```bash
 # 1. Build
 cargo build --release
-# Binary: target/release/moo
+# Binary: target/release/mariadb-cow
 
 # 2. Start MariaDB (if not already running)
 docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=secret mariadb:latest
 
 # 3. Start the proxy (listens on :3307, reads upstream on :3306)
-./target/release/moo start \
+./target/release/mariadb-cow start \
   --upstream=localhost:3306 \
   --listen=localhost:3307 \
   --user=root \
@@ -32,34 +32,52 @@ mysql -h 127.0.0.1 -P 3307 -u root mydb
 The upstream user needs `SELECT` and `CREATE TEMPORARY TABLES` — no write privileges are required:
 
 ```sql
-GRANT SELECT, CREATE TEMPORARY TABLES ON mydb.* TO 'moo_user'@'%';
+GRANT SELECT, CREATE TEMPORARY TABLES ON mydb.* TO 'cow_user'@'%';
 ```
 
-## Usage
+## CLI Reference
 
 ### start
 
 Start the proxy. CLI flags override config file values.
 
 ```bash
-moo start \
+mariadb-cow start \
   --upstream=localhost:3306 \
   --listen=localhost:3307 \
   --overlay=./dev-overlay \
+  --overlay-name=default \
   --user=root \
   --password=secret \
-  --config=moo.toml
+  --config=cow.toml
+
+# Enable live query logging to stdout
+mariadb-cow start --upstream=localhost:3306 --watch
+
+# Filter watch output to specific operations or table names
+mariadb-cow start --upstream=localhost:3306 --watch --watch-filter=INSERT
+mariadb-cow start --upstream=localhost:3306 --watch --watch-filter=users
 ```
 
-Defaults: `upstream=localhost:3306`, `listen=localhost:3307`, `overlay=./dev-overlay`.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--upstream` | `localhost:3306` | Upstream MariaDB/MySQL address |
+| `--listen` | `localhost:3307` | Address the proxy listens on |
+| `--overlay` | `./dev-overlay` | Path to the overlay base directory |
+| `--overlay-name` | `default` | Named overlay to use within the base directory |
+| `--user` | — | Database user |
+| `--password` | — | Database password |
+| `--config` | — | Path to TOML config file |
+| `--watch` | off | Enable live query logging to stdout |
+| `--watch-filter` | — | Filter watch output (e.g. `INSERT`, `SELECT`, or a table name) |
 
 ### status
 
 Show overlay size and dirty table count.
 
 ```bash
-moo status
-moo status --overlay=./dev-overlay
+mariadb-cow status
+mariadb-cow status --overlay=./dev-overlay
 ```
 
 ### reset
@@ -67,9 +85,9 @@ moo status --overlay=./dev-overlay
 Wipe the overlay. Resets all tables or a single named table.
 
 ```bash
-moo reset                   # wipe everything
-moo reset users             # wipe only the users table
-moo reset --overlay=./dev-overlay users
+mariadb-cow reset                          # wipe everything
+mariadb-cow reset users                    # wipe only the users table
+mariadb-cow reset --overlay=./dev-overlay users
 ```
 
 ### tables
@@ -77,8 +95,151 @@ moo reset --overlay=./dev-overlay users
 List every table that has overlay data, with flags indicating whether schema or row data is present.
 
 ```bash
-moo tables
-moo tables --overlay=./dev-overlay
+mariadb-cow tables
+mariadb-cow tables --overlay=./dev-overlay
+```
+
+### diff
+
+Show what changed in the overlay compared to the base database.
+
+```bash
+# Table-level summary (default)
+mariadb-cow diff
+
+# Row-level details
+mariadb-cow diff --verbose
+
+# Output as SQL statements
+mariadb-cow diff --format=sql
+
+# Show old->new values for UPDATEs (requires upstream access)
+mariadb-cow diff --full \
+  --upstream=localhost:3306 \
+  --user=root \
+  --password=secret
+
+# Filter to a specific table or database
+mariadb-cow diff --table=users
+mariadb-cow diff --db=mydb --verbose
+
+mariadb-cow diff --overlay=./dev-overlay --format=sql
+```
+
+| Flag | Description |
+|------|-------------|
+| `--format` | Output format: `text` (default) or `sql` |
+| `--verbose` | Show row-level details instead of table summary |
+| `--full` | Fetch base rows and show old→new diff for UPDATEs |
+| `--upstream` | Upstream address (required with `--full`) |
+| `--user` | Upstream user (required with `--full`) |
+| `--password` | Upstream password (required with `--full`) |
+| `--table` | Filter to a specific table |
+| `--db` | Filter to a specific database |
+
+### apply
+
+Apply overlay changes to the upstream database. Requires write access to the upstream.
+
+```bash
+# Preview what would be applied
+mariadb-cow apply \
+  --upstream=localhost:3306 \
+  --user=root \
+  --password=secret \
+  --dry-run
+
+# Apply with confirmation prompt
+mariadb-cow apply \
+  --upstream=localhost:3306 \
+  --user=root \
+  --password=secret
+
+# Apply without prompt, then reset the overlay
+mariadb-cow apply \
+  --upstream=localhost:3306 \
+  --user=root \
+  --password=secret \
+  --yes \
+  --reset
+
+# Apply only a specific database or table
+mariadb-cow apply --upstream=localhost:3306 --user=root --db=mydb
+mariadb-cow apply --upstream=localhost:3306 --user=root --table=users
+```
+
+| Flag | Description |
+|------|-------------|
+| `--upstream` | Upstream MariaDB address (required) |
+| `--user` | Upstream database user (required) |
+| `--password` | Upstream database password |
+| `--dry-run` | Show what would be applied without executing |
+| `--yes` | Skip confirmation prompt |
+| `--reset` | Reset the overlay after a successful apply |
+| `--db` | Apply only this database |
+| `--table` | Apply only this table |
+
+### snapshot / restore / snapshots
+
+Save and restore named snapshots of the overlay state.
+
+```bash
+# Save current overlay as a snapshot
+mariadb-cow snapshot before-migration
+mariadb-cow snapshot before-migration --force   # overwrite existing
+
+# Restore a snapshot
+mariadb-cow restore before-migration
+
+# List all saved snapshots
+mariadb-cow snapshots
+
+# With a custom overlay path
+mariadb-cow snapshot my-snap --overlay=./dev-overlay
+mariadb-cow restore my-snap --overlay=./dev-overlay
+mariadb-cow snapshots --overlay=./dev-overlay
+```
+
+### overlay
+
+Manage named overlays. Each overlay is an independent SQLite layer stored under the base directory. This lets you maintain multiple independent change sets against the same upstream.
+
+```bash
+# Create a new empty overlay
+mariadb-cow overlay create feature-x
+
+# List all overlays (active one is marked)
+mariadb-cow overlay list
+
+# Show which overlay is currently active
+mariadb-cow overlay active
+
+# Switch to a different overlay (restart proxy to take effect)
+mariadb-cow overlay switch feature-x
+
+# Copy an overlay as the basis for a new one
+mariadb-cow overlay branch feature-x feature-x-v2
+
+# Merge source overlay into target (reports conflicts, does not auto-resolve)
+mariadb-cow overlay merge feature-x main
+
+# Delete an overlay
+mariadb-cow overlay delete feature-x
+
+# All overlay commands accept --base to override the overlay directory
+mariadb-cow overlay list --base=./dev-overlay
+```
+
+### diff-overlays
+
+Compare two overlay directories, like `git diff branch-a branch-b`.
+
+```bash
+mariadb-cow diff-overlays ./dev-overlay/feature-x ./dev-overlay/main
+
+# Filter to a specific database or table
+mariadb-cow diff-overlays ./overlay-a ./overlay-b --db=mydb
+mariadb-cow diff-overlays ./overlay-a ./overlay-b --table=users
 ```
 
 ## Config File
@@ -86,7 +247,7 @@ moo tables --overlay=./dev-overlay
 All fields are optional. CLI flags take priority over the config file.
 
 ```toml
-# moo.toml
+# cow.toml
 
 [upstream]
 host     = "localhost"
@@ -101,7 +262,7 @@ listen = "localhost:3307"
 path = "./dev-overlay/"
 ```
 
-Pass the config file with `--config=moo.toml` on the `start` command.
+Pass the config file with `--config=cow.toml` on the `start` command.
 
 ## How It Works
 
@@ -120,16 +281,39 @@ The proxy speaks the MySQL wire protocol (`opensrv-mysql`) so any MySQL-compatib
 
 **Overlay storage**
 
-One SQLite file per database lives under the overlay directory (`./dev-overlay/mydb.db`). Overlay rows use auto-decrement IDs starting from `2^63-1` to avoid collisions with base DB IDs.
+One SQLite file per database lives under the overlay directory (`./dev-overlay/default/mydb.db`). Overlay rows use auto-decrement IDs starting from `2^63-1` to avoid collisions with base DB IDs. Named overlays are stored as subdirectories of the base overlay path.
 
 **Session model**
 
-Each client connection gets a dedicated upstream connection. Temporary tables are session-scoped in MariaDB, so isolation between clients is automatic. Multiple `moo` instances can point at the same upstream simultaneously.
+Each client connection gets a dedicated upstream connection. Temporary tables are session-scoped in MariaDB, so isolation between clients is automatic. Multiple `mariadb-cow` instances can point at the same upstream simultaneously.
 
 ```
-Client A  -->  moo (:3307)  -->  upstream conn 1  (temp tables for A)
-Client B  -->  moo (:3307)  -->  upstream conn 2  (temp tables for B)
+Client A  -->  mariadb-cow (:3307)  -->  upstream conn 1  (temp tables for A)
+Client B  -->  mariadb-cow (:3307)  -->  upstream conn 2  (temp tables for B)
 ```
+
+## Docker
+
+A multi-stage Dockerfile is included. The final image is based on `debian:bookworm-slim` and contains only the binary.
+
+```bash
+# Build the image
+docker build -t mariadb-cow .
+
+# Run the proxy container, pointing at an upstream MariaDB
+docker run -d \
+  -p 3307:3307 \
+  -v $(pwd)/dev-overlay:/overlay \
+  -e UPSTREAM=mydb-host:3306 \
+  mariadb-cow start \
+    --upstream=mydb-host:3306 \
+    --listen=0.0.0.0:3307 \
+    --overlay=/overlay \
+    --user=root \
+    --password=secret
+```
+
+The default `CMD` is `start --listen=0.0.0.0:3307`. Override it by appending arguments after the image name.
 
 ## Supported Operations
 
@@ -152,31 +336,53 @@ Client B  -->  moo (:3307)  -->  upstream conn 2  (temp tables for B)
 | Prepared statement forwarding | Supported |
 | Multi-database support (USE db) | Supported |
 | Foreign key constraint enforcement (RESTRICT, CASCADE, SET NULL) | Supported |
+| Named overlays (create / list / switch / branch / merge) | Supported |
+| Snapshots (save / restore / list) | Supported |
+| Apply overlay to upstream (with dry-run) | Supported |
+| Cross-overlay diff | Supported |
+| Live query watch with filter | Supported |
 
 ## Known Limitations
 
-- **No commit-back.** Overlay changes cannot be merged into the upstream database. By design.
+- **No automatic merge conflict resolution.** `overlay merge` reports conflicts but does not auto-resolve them.
 - **No LOAD DATA INFILE.** Bulk load statements are not intercepted.
 - **No replication support.** The proxy is not a replication replica.
 - **Prepared statements on dirty tables** read base data at PREPARE time rather than the merged view. Rewriting at PREPARE time is planned.
 - **Complex stored procedures** with cursors, dynamic SQL (`EXECUTE`), or deeply nested calls may not rewrite correctly.
 - **Foreign key UPDATE constraints** (when a PK value changes) are not enforced.
-- **No connection pooling.** Each client gets a dedicated upstream connection to keep temporary tables isolated. A pooled mode (rebuild temps on checkout, clean up on checkin) is planned but not yet implemented.
+- **No connection pooling.** Each client gets a dedicated upstream connection to keep temporary tables isolated. A pooled mode is planned but not yet implemented.
+
+## Testing
+
+**Unit tests**
+
+```bash
+cargo test
+```
+
+**Integration tests**
+
+Integration tests require a running MariaDB instance. The test suite is in `tests/integration.rs` and uses Docker to start MariaDB automatically.
+
+```bash
+# Run integration tests (Docker must be available)
+cargo test --test integration
+
+# Run with output visible
+cargo test --test integration -- --nocapture
+```
+
+The integration tests spin up a MariaDB container, run the proxy against it, execute a suite of SQL operations, and verify the overlay behaves correctly — all without touching the upstream data.
 
 ## Building
 
 ```bash
+# Release build
 cargo build --release
+# Binary: target/release/mariadb-cow
+
+# Debug build (faster compile, slower runtime)
+cargo build
 ```
 
 Requires Rust 1.70+. SQLite is bundled via `rusqlite` — no system SQLite dependency needed.
-
-```bash
-# Debug build (faster compile, slower runtime)
-cargo build
-
-# Run tests
-cargo test
-```
-
-The release binary is at `target/release/moo`.
