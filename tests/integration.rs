@@ -338,6 +338,9 @@ async fn start_proxy(overlay_dir: &std::path::Path, proxy_port: u16) -> tokio::p
         cmd.env("RUST_LOG", "error");
     }
 
+    // Brief pause to allow any previously-bound port to be released by the OS.
+    sleep(Duration::from_millis(200)).await;
+
     let child = cmd.spawn().expect("failed to spawn proxy process");
 
     // Poll the proxy port until it starts accepting connections (up to 30 s).
@@ -1589,7 +1592,7 @@ async fn test_cli_apply_dry_run() {
     let output = Command::new("./target/debug/mariadb-cow")
         .args([
             "apply",
-            &format!("--overlay={}", fix._overlay_dir.path().display()),
+            &format!("--overlay={}/default", fix._overlay_dir.path().display()),
             &format!("--upstream=127.0.0.1:{}", UPSTREAM_PORT),
             "--user=root",
             "--password=testpass",
@@ -1638,7 +1641,7 @@ async fn test_cli_apply_commits_to_upstream() {
     let output = Command::new("./target/debug/mariadb-cow")
         .args([
             "apply",
-            &format!("--overlay={}", fix._overlay_dir.path().display()),
+            &format!("--overlay={}/default", fix._overlay_dir.path().display()),
             &format!("--upstream=127.0.0.1:{}", UPSTREAM_PORT),
             "--user=root",
             "--password=testpass",
@@ -1784,7 +1787,7 @@ async fn test_cli_overlay_lifecycle() {
 
     // 1. Create "dev" overlay
     let out = Command::new(binary)
-        .args(["overlay", "create", "dev", &format!("--base={}", base)])
+        .args(["overlay", &format!("--base={}", base), "create", "dev"])
         .output()
         .unwrap();
     assert!(
@@ -1795,7 +1798,7 @@ async fn test_cli_overlay_lifecycle() {
 
     // 2. Create "staging" overlay
     let out = Command::new(binary)
-        .args(["overlay", "create", "staging", &format!("--base={}", base)])
+        .args(["overlay", &format!("--base={}", base), "create", "staging"])
         .output()
         .unwrap();
     assert!(
@@ -1806,7 +1809,7 @@ async fn test_cli_overlay_lifecycle() {
 
     // 3. List overlays -> shows dev, staging
     let out = Command::new(binary)
-        .args(["overlay", "list", &format!("--base={}", base)])
+        .args(["overlay", &format!("--base={}", base), "list"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1822,7 +1825,7 @@ async fn test_cli_overlay_lifecycle() {
 
     // 4. Switch to "staging"
     let out = Command::new(binary)
-        .args(["overlay", "switch", "staging", &format!("--base={}", base)])
+        .args(["overlay", &format!("--base={}", base), "switch", "staging"])
         .output()
         .unwrap();
     assert!(
@@ -1833,7 +1836,7 @@ async fn test_cli_overlay_lifecycle() {
 
     // 5. Active overlay should be "staging"
     let out = Command::new(binary)
-        .args(["overlay", "active", &format!("--base={}", base)])
+        .args(["overlay", &format!("--base={}", base), "active"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1845,7 +1848,7 @@ async fn test_cli_overlay_lifecycle() {
 
     // 6. Delete "dev"
     let out = Command::new(binary)
-        .args(["overlay", "delete", "dev", &format!("--base={}", base)])
+        .args(["overlay", &format!("--base={}", base), "delete", "dev"])
         .output()
         .unwrap();
     assert!(
@@ -1856,7 +1859,7 @@ async fn test_cli_overlay_lifecycle() {
 
     // 7. List -> only "staging"
     let out = Command::new(binary)
-        .args(["overlay", "list", &format!("--base={}", base)])
+        .args(["overlay", &format!("--base={}", base), "list"])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1881,7 +1884,7 @@ async fn test_cli_overlay_branch() {
 
     // Create "main" overlay
     let out = Command::new(binary)
-        .args(["overlay", "create", "main", &format!("--base={}", base)])
+        .args(["overlay", &format!("--base={}", base), "create", "main"])
         .output()
         .unwrap();
     assert!(out.status.success(), "overlay create main should succeed");
@@ -1894,10 +1897,10 @@ async fn test_cli_overlay_branch() {
     let out = Command::new(binary)
         .args([
             "overlay",
+            &format!("--base={}", base),
             "branch",
             "main",
             "feature-x",
-            &format!("--base={}", base),
         ])
         .output()
         .unwrap();
@@ -1926,7 +1929,7 @@ async fn test_cli_overlay_merge() {
 
     // Create "main" overlay
     let out = Command::new(binary)
-        .args(["overlay", "create", "main", &format!("--base={}", base)])
+        .args(["overlay", &format!("--base={}", base), "create", "main"])
         .output()
         .unwrap();
     assert!(out.status.success(), "overlay create main should succeed");
@@ -1935,10 +1938,10 @@ async fn test_cli_overlay_merge() {
     let out = Command::new(binary)
         .args([
             "overlay",
+            &format!("--base={}", base),
             "branch",
             "main",
             "feature",
-            &format!("--base={}", base),
         ])
         .output()
         .unwrap();
@@ -1954,10 +1957,10 @@ async fn test_cli_overlay_merge() {
     let out = Command::new(binary)
         .args([
             "overlay",
+            &format!("--base={}", base),
             "merge",
             "feature",
             "main",
-            &format!("--base={}", base),
         ])
         .output()
         .unwrap();
