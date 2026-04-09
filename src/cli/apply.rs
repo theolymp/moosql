@@ -42,10 +42,10 @@ fn collect_statements(
         };
 
         // Apply db filter
-        if let Some(filter) = db_filter {
-            if db_name != filter {
-                continue;
-            }
+        if let Some(filter) = db_filter
+            && db_name != filter
+        {
+            continue;
         }
 
         let store = OverlayStore::open(overlay_dir, &db_name)?;
@@ -59,32 +59,32 @@ fn collect_statements(
 
         for info in dirty {
             // Apply table filter
-            if let Some(filter) = table_filter {
-                if info.table_name != filter {
-                    continue;
-                }
+            if let Some(filter) = table_filter
+                && info.table_name != filter
+            {
+                continue;
             }
 
             let table = &info.table_name;
             let is_truncated = reg.is_truncated(table)?;
 
             // DDL first
-            if info.has_schema {
-                if let Some(schema_sql) = tracker.get_overlay_schema(table)? {
-                    if schema_sql == "DROPPED" {
-                        statements.push(ApplyStatement {
-                            db_name: db_name.clone(),
-                            table_name: table.clone(),
-                            sql: format!("DROP TABLE IF EXISTS `{}`;", table),
-                        });
-                    } else {
-                        // schema_sql may be CREATE TABLE or ALTER TABLE
-                        statements.push(ApplyStatement {
-                            db_name: db_name.clone(),
-                            table_name: table.clone(),
-                            sql: format!("{};", schema_sql.trim_end_matches(';')),
-                        });
-                    }
+            if info.has_schema
+                && let Some(schema_sql) = tracker.get_overlay_schema(table)?
+            {
+                if schema_sql == "DROPPED" {
+                    statements.push(ApplyStatement {
+                        db_name: db_name.clone(),
+                        table_name: table.clone(),
+                        sql: format!("DROP TABLE IF EXISTS `{}`;", table),
+                    });
+                } else {
+                    // schema_sql may be CREATE TABLE or ALTER TABLE
+                    statements.push(ApplyStatement {
+                        db_name: db_name.clone(),
+                        table_name: table.clone(),
+                        sql: format!("{};", schema_sql.trim_end_matches(';')),
+                    });
                 }
             }
 
@@ -212,6 +212,7 @@ fn format_sql_value(val: &str) -> String {
     format!("'{}'", escaped)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_apply(
     overlay_dir: &Path,
     upstream_addr: &str,

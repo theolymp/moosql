@@ -54,10 +54,10 @@ pub fn collect_diffs(
             None => continue,
         };
 
-        if let Some(filter) = db_filter {
-            if db_name != filter {
-                continue;
-            }
+        if let Some(filter) = db_filter
+            && db_name != filter
+        {
+            continue;
         }
 
         let store = OverlayStore::open(overlay_dir, &db_name)
@@ -67,10 +67,10 @@ pub fn collect_diffs(
         let dirty = reg.list_dirty()?;
 
         for info in dirty {
-            if let Some(filter) = table_filter {
-                if info.table_name != filter {
-                    continue;
-                }
+            if let Some(filter) = table_filter
+                && info.table_name != filter
+            {
+                continue;
             }
 
             let truncated = reg.is_truncated(&info.table_name).unwrap_or(false);
@@ -442,6 +442,7 @@ fn sql_literal(v: &str) -> String {
 }
 
 /// Top-level entry point for the diff command.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_diff(
     overlay_dir: &Path,
     format: DiffFormat,

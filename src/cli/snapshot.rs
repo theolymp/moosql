@@ -156,10 +156,9 @@ pub fn list_snapshots(overlay_dir: &Path) -> Result<()> {
     let name_w = entries.iter().map(|(n, _, _)| n.len()).max().unwrap_or(4).max(4);
 
     println!(
-        "{:<name_w$}  {:<20}  {}",
+        "{:<name_w$}  {:<20}  SIZE",
         "NAME",
         "DATE",
-        "SIZE",
         name_w = name_w,
     );
     println!("{}", "-".repeat(name_w + 30));

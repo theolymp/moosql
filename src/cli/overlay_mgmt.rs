@@ -120,10 +120,10 @@ pub fn list_overlays(base: &Path) -> Result<()> {
     {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                overlays.push(name.to_string());
-            }
+        if path.is_dir()
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+        {
+            overlays.push(name.to_string());
         }
     }
 
