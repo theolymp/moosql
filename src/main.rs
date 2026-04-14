@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
                 upstream_user,
                 upstream_password,
                 overlay_dir,
+                args.auth_passthrough,
                 args.watch,
                 args.watch_filter,
             );

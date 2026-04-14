@@ -12,17 +12,20 @@ pub struct ProxyServer {
     pub upstream_user: String,
     pub upstream_password: String,
     pub overlay_dir: PathBuf,
+    pub auth_passthrough: bool,
     pub watch: bool,
     pub watch_filter: Option<String>,
 }
 
 impl ProxyServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         listen_addr: impl Into<String>,
         upstream_addr: impl Into<String>,
         upstream_user: impl Into<String>,
         upstream_password: impl Into<String>,
         overlay_dir: impl Into<PathBuf>,
+        auth_passthrough: bool,
         watch: bool,
         watch_filter: Option<String>,
     ) -> Self {
@@ -32,6 +35,7 @@ impl ProxyServer {
             upstream_user: upstream_user.into(),
             upstream_password: upstream_password.into(),
             overlay_dir: overlay_dir.into(),
+            auth_passthrough,
             watch,
             watch_filter,
         }
@@ -62,11 +66,12 @@ impl ProxyServer {
                     let upstream_user = self.upstream_user.clone();
                     let upstream_password = self.upstream_password.clone();
                     let overlay_dir = self.overlay_dir.clone();
+                    let auth_passthrough = self.auth_passthrough;
                     let watch = self.watch;
                     let watch_filter = self.watch_filter.clone();
 
                     tokio::spawn(async move {
-                        let handler = CowHandler::new(upstream_addr, upstream_user, upstream_password, overlay_dir, watch, watch_filter);
+                        let handler = CowHandler::new(upstream_addr, upstream_user, upstream_password, overlay_dir, auth_passthrough, watch, watch_filter);
 
                         // Split the TCP stream into read/write halves for opensrv-mysql
                         let (reader, writer) = socket.into_split();

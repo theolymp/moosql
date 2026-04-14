@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use mysql_async::prelude::*;
@@ -95,6 +96,12 @@ pub struct CowHandler {
     /// Cached PK column map (table_name -> pk_column_name), rebuilt whenever
     /// dirty_tables is refreshed. Avoids recomputing on every query.
     pk_columns_cache: HashMap<String, String>,
+    /// Whether auth passthrough is enabled (clients provide own credentials).
+    auth_passthrough: bool,
+    /// Client credentials captured during auth handshake (for passthrough to upstream).
+    client_user: Mutex<Option<String>>,
+    /// Client password captured during auth handshake (for passthrough to upstream).
+    client_password: Mutex<Option<String>>,
     /// Whether live query logging to stdout is enabled.
     watch: bool,
     /// Optional filter: only log queries whose SQL or action contains this substring (case-insensitive).
@@ -107,6 +114,7 @@ impl CowHandler {
         upstream_user: String,
         upstream_password: String,
         overlay_dir: PathBuf,
+        auth_passthrough: bool,
         watch: bool,
         watch_filter: Option<String>,
     ) -> Self {
@@ -127,6 +135,9 @@ impl CowHandler {
             schema_cache: SchemaCache::new(),
             dirty_tables_stale: true,
             pk_columns_cache: HashMap::new(),
+            auth_passthrough,
+            client_user: Mutex::new(None),
+            client_password: Mutex::new(None),
             watch,
             watch_filter,
         }
@@ -167,6 +178,38 @@ impl CowHandler {
             "[{}] conn={} {:<12} {:.1}ms {}",
             ts, self.conn_id, action, elapsed_ms, sql
         );
+    }
+
+    /// Return the effective overlay directory. When auth passthrough is enabled,
+    /// this is a per-user subdirectory under the base overlay dir.
+    fn user_overlay_dir(&self) -> PathBuf {
+        if self.auth_passthrough {
+            let user = self.client_user.lock().unwrap().clone()
+                .unwrap_or_else(|| "default".to_string());
+            self.overlay_dir.join(&user)
+        } else {
+            self.overlay_dir.clone()
+        }
+    }
+
+    /// Return the effective upstream user (client-supplied if passthrough, else configured).
+    fn effective_user(&self) -> String {
+        if self.auth_passthrough {
+            self.client_user.lock().unwrap().clone()
+                .unwrap_or_else(|| self.upstream_user.clone())
+        } else {
+            self.upstream_user.clone()
+        }
+    }
+
+    /// Return the effective upstream password (client-supplied if passthrough, else configured).
+    fn effective_password(&self) -> String {
+        if self.auth_passthrough {
+            self.client_password.lock().unwrap().clone()
+                .unwrap_or_else(|| self.upstream_password.clone())
+        } else {
+            self.upstream_password.clone()
+        }
     }
 
     /// Connect to the upstream MariaDB server with given credentials.
@@ -213,7 +256,7 @@ impl CowHandler {
             return;
         }
         if let Some(ref db) = self.current_db {
-            match OverlayStore::open(&self.overlay_dir, db) {
+            match OverlayStore::open(&self.user_overlay_dir(), db) {
                 Ok(store) => {
                     let reg = Registry::new(&store.conn);
                     match reg.list_dirty() {
@@ -624,7 +667,7 @@ impl CowHandler {
             // Open overlay store and write SET NULL updates
             // (OverlayStore uses rusqlite which is !Send — open, use, drop before .await)
             {
-                let store = OverlayStore::open(&self.overlay_dir, &db).map_err(|e| {
+                let store = OverlayStore::open(&self.user_overlay_dir(), &db).map_err(|e| {
                     io::Error::other(
                         format!("Failed to open overlay for FK SET NULL: {e}"),
                     )
@@ -749,7 +792,7 @@ impl CowHandler {
 
             // Open overlay store, write tombstones for the child rows
             {
-                let store = OverlayStore::open(&self.overlay_dir, &db).map_err(|e| {
+                let store = OverlayStore::open(&self.user_overlay_dir(), &db).map_err(|e| {
                     io::Error::other(
                         format!("Failed to open overlay for FK CASCADE: {e}"),
                     )
@@ -860,7 +903,7 @@ impl CowHandler {
             None => return Ok(()), // No database selected — nothing to do.
         };
 
-        let store = match crate::overlay::store::OverlayStore::open(&self.overlay_dir, &db) {
+        let store = match crate::overlay::store::OverlayStore::open(&self.user_overlay_dir(), &db) {
             Ok(s) => s,
             Err(e) => {
                 debug!(conn_id = self.conn_id, error = %e, "No overlay store; skipping temp-table population");
@@ -991,8 +1034,8 @@ impl CowHandler {
                     error = %e,
                     "Upstream connection error — attempting reconnect"
                 );
-                let user = self.upstream_user.clone();
-                let pass = self.upstream_password.clone();
+                let user = self.effective_user();
+                let pass = self.effective_password();
                 let db = self.current_db.clone();
                 match self.connect_upstream(&user, &pass, db.as_deref()).await {
                     Ok(()) => {
@@ -1068,7 +1111,7 @@ impl CowHandler {
     ) -> io::Result<()> {
         // Gather overlay-only table names before forwarding (no async borrow conflict).
         let overlay_only_tables: Vec<String> = if let Some(ref db) = self.current_db.clone() {
-            match OverlayStore::open(&self.overlay_dir, db) {
+            match OverlayStore::open(&self.user_overlay_dir(), db) {
                 Ok(store) => {
                     let reg = Registry::new(&store.conn);
                     match reg.list_dirty() {
@@ -1289,7 +1332,7 @@ impl CowHandler {
             }
         };
 
-        match OverlayStore::open(&self.overlay_dir, &db) {
+        match OverlayStore::open(&self.user_overlay_dir(), &db) {
             Ok(store) => {
                 match writer::execute_insert(&store, stmt, &schema, &defaults) {
                     Ok(wr) => Ok(Some((wr, table_name))),
@@ -1407,7 +1450,7 @@ impl CowHandler {
             }
         };
 
-        match OverlayStore::open(&self.overlay_dir, &db) {
+        match OverlayStore::open(&self.user_overlay_dir(), &db) {
             Ok(store) => {
                 match writer::execute_update(&store, stmt, &schema, &upstream_rows) {
                     Ok(wr) => Ok(Some((wr, table_name))),
@@ -1533,7 +1576,7 @@ impl CowHandler {
 
                         // Write SET NULL overlay rows
                         {
-                            let store = match OverlayStore::open(&self.overlay_dir, &db) {
+                            let store = match OverlayStore::open(&self.user_overlay_dir(), &db) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     warn!(conn_id = self.conn_id, error = %e, "FK SET NULL overlay open failed");
@@ -1605,7 +1648,7 @@ impl CowHandler {
 
                         // Write tombstones for cascaded child rows
                         {
-                            let store = match OverlayStore::open(&self.overlay_dir, &db) {
+                            let store = match OverlayStore::open(&self.user_overlay_dir(), &db) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     warn!(conn_id = self.conn_id, error = %e, "FK CASCADE overlay open failed");
@@ -1673,7 +1716,7 @@ impl CowHandler {
             }
         };
 
-        match OverlayStore::open(&self.overlay_dir, &db) {
+        match OverlayStore::open(&self.user_overlay_dir(), &db) {
             Ok(store) => {
                 match writer::execute_delete(&store, stmt, &schema, &upstream_pks) {
                     Ok(wr) => Ok(Some((wr, table_name))),
@@ -1725,7 +1768,7 @@ impl CowHandler {
             }
         };
 
-        match OverlayStore::open(&self.overlay_dir, &db) {
+        match OverlayStore::open(&self.user_overlay_dir(), &db) {
             Ok(store) => {
                 match writer::execute_ddl(&store, sql, stmt) {
                     Ok(wr) => {
@@ -1761,24 +1804,53 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
         self.conn_id
     }
 
+    fn default_auth_plugin(&self) -> &str {
+        if self.auth_passthrough {
+            "mysql_clear_password"
+        } else {
+            "mysql_native_password"
+        }
+    }
+
+    async fn auth_plugin_for_username(&self, _user: &[u8]) -> &str {
+        if self.auth_passthrough {
+            "mysql_clear_password"
+        } else {
+            "mysql_native_password"
+        }
+    }
+
     /// Accept all client connections — actual auth is handled by the upstream server.
-    /// We capture the client username here for logging purposes only; the real
-    /// credential check happens when we connect to upstream in on_query/on_init.
+    /// When auth passthrough is enabled, capture the client's cleartext credentials
+    /// for use when connecting upstream (per-user isolation).
     async fn authenticate(
         &self,
         _auth_plugin: &str,
         username: &[u8],
         _salt: &[u8],
-        _auth_data: &[u8],
+        auth_data: &[u8],
     ) -> bool {
-        let client_user = String::from_utf8_lossy(username);
-        info!(
-            conn_id = self.conn_id,
-            client_user = %client_user,
-            upstream_user = %self.upstream_user,
-            "Client authenticated (upstream credentials will be used)"
-        );
-        true
+        let user = String::from_utf8_lossy(username).to_string();
+
+        if self.auth_passthrough {
+            // auth_data contains the cleartext password (NUL-terminated) when using mysql_clear_password
+            let pass = String::from_utf8_lossy(auth_data).trim_end_matches('\0').to_string();
+            info!(
+                conn_id = self.conn_id,
+                client_user = %user,
+                "Auth passthrough: captured client credentials"
+            );
+            *self.client_user.lock().unwrap() = Some(user);
+            *self.client_password.lock().unwrap() = Some(pass);
+        } else {
+            info!(
+                conn_id = self.conn_id,
+                client_user = %user,
+                upstream_user = %self.upstream_user,
+                "Client authenticated (upstream credentials will be used)"
+            );
+        }
+        true // Always accept — real auth happens when connecting upstream
     }
 
     async fn on_prepare<'a>(
@@ -1790,8 +1862,8 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
 
         // Ensure upstream connection exists.
         if self.upstream.is_none() {
-            let user = self.upstream_user.clone();
-            let password = self.upstream_password.clone();
+            let user = self.effective_user();
+            let password = self.effective_password();
             let db = self.current_db.clone();
             match self.connect_upstream(&user, &password, db.as_deref()).await {
                 Ok(()) => {}
@@ -2011,8 +2083,8 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
 
         // If no upstream connection yet, establish one with the target database.
         if self.upstream.is_none() {
-            let user = self.upstream_user.clone();
-            let password = self.upstream_password.clone();
+            let user = self.effective_user();
+            let password = self.effective_password();
             match self
                 .connect_upstream(&user, &password, Some(db_name))
                 .await
@@ -2069,10 +2141,10 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
     ) -> io::Result<()> {
         debug!(conn_id = self.conn_id, sql = %query, "QUERY");
 
-        // If no upstream connection yet, establish one using configured credentials.
+        // If no upstream connection yet, establish one using effective credentials.
         if self.upstream.is_none() {
-            let user = self.upstream_user.clone();
-            let password = self.upstream_password.clone();
+            let user = self.effective_user();
+            let password = self.effective_password();
             let db = self.current_db.clone();
             match self.connect_upstream(&user, &password, db.as_deref()).await {
                 Ok(()) => {
@@ -2409,4 +2481,101 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as u32, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_overlay_dir_without_passthrough() {
+        let handler = CowHandler::new(
+            "localhost:3306".to_string(),
+            "root".to_string(),
+            "".to_string(),
+            PathBuf::from("/tmp/overlay"),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(handler.user_overlay_dir(), PathBuf::from("/tmp/overlay"));
+    }
+
+    #[test]
+    fn user_overlay_dir_with_passthrough_default() {
+        let handler = CowHandler::new(
+            "localhost:3306".to_string(),
+            "root".to_string(),
+            "".to_string(),
+            PathBuf::from("/tmp/overlay"),
+            true,
+            false,
+            None,
+        );
+        // No client credentials captured yet, falls back to "default"
+        assert_eq!(handler.user_overlay_dir(), PathBuf::from("/tmp/overlay/default"));
+    }
+
+    #[test]
+    fn user_overlay_dir_with_passthrough_and_user() {
+        let handler = CowHandler::new(
+            "localhost:3306".to_string(),
+            "root".to_string(),
+            "".to_string(),
+            PathBuf::from("/tmp/overlay"),
+            true,
+            false,
+            None,
+        );
+        *handler.client_user.lock().unwrap() = Some("alice".to_string());
+        assert_eq!(handler.user_overlay_dir(), PathBuf::from("/tmp/overlay/alice"));
+    }
+
+    #[test]
+    fn effective_credentials_without_passthrough() {
+        let handler = CowHandler::new(
+            "localhost:3306".to_string(),
+            "root".to_string(),
+            "secret".to_string(),
+            PathBuf::from("/tmp/overlay"),
+            false,
+            false,
+            None,
+        );
+        assert_eq!(handler.effective_user(), "root");
+        assert_eq!(handler.effective_password(), "secret");
+    }
+
+    #[test]
+    fn effective_credentials_with_passthrough() {
+        let handler = CowHandler::new(
+            "localhost:3306".to_string(),
+            "root".to_string(),
+            "secret".to_string(),
+            PathBuf::from("/tmp/overlay"),
+            true,
+            false,
+            None,
+        );
+        *handler.client_user.lock().unwrap() = Some("alice".to_string());
+        *handler.client_password.lock().unwrap() = Some("alicepass".to_string());
+        assert_eq!(handler.effective_user(), "alice");
+        assert_eq!(handler.effective_password(), "alicepass");
+    }
+
+    #[test]
+    fn effective_credentials_passthrough_falls_back() {
+        let handler = CowHandler::new(
+            "localhost:3306".to_string(),
+            "root".to_string(),
+            "secret".to_string(),
+            PathBuf::from("/tmp/overlay"),
+            true,
+            false,
+            None,
+        );
+        // No client creds set, should fall back to configured
+        assert_eq!(handler.effective_user(), "root");
+        assert_eq!(handler.effective_password(), "secret");
+    }
 }

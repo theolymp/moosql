@@ -67,6 +67,10 @@ pub struct StartArgs {
     #[arg(long)]
     pub config: Option<PathBuf>,
 
+    /// Enable auth passthrough (clients provide their own credentials, per-user overlay isolation)
+    #[arg(long)]
+    pub auth_passthrough: bool,
+
     /// Enable live query logging to stdout
     #[arg(long)]
     pub watch: bool,
