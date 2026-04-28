@@ -151,7 +151,7 @@ pub fn list_snapshots(overlay_dir: &Path) -> Result<()> {
     }
 
     // Sort by modified time, newest first
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
 
     let name_w = entries.iter().map(|(n, _, _)| n.len()).max().unwrap_or(4).max(4);
 
