@@ -87,11 +87,31 @@ moo start --upstream=localhost:3306 --watch --watch-filter=users
 | `--listen` | `localhost:3307` | Address the proxy listens on |
 | `--overlay` | `./dev-overlay` | Path to the overlay base directory |
 | `--overlay-name` | `default` | Named overlay to use within the base directory |
-| `--user` | — | Database user |
-| `--password` | — | Database password |
+| `--user` | — | Database user (env: `MOO_UPSTREAM_USER`) |
+| `--password` | — | Database password (env: `MOO_UPSTREAM_PASSWORD`) |
+| `--auth-passthrough` | off | Clients provide own credentials, per-user overlay isolation |
 | `--config` | — | Path to TOML config file |
 | `--watch` | off | Enable live query logging to stdout |
 | `--watch-filter` | — | Filter watch output (e.g. `INSERT`, `SELECT`, or a table name) |
+
+#### Environment variables
+
+For container deployments, upstream credentials can be provided via env vars instead of CLI args:
+
+| Variable | Maps to | Used by |
+|----------|---------|---------|
+| `MOO_UPSTREAM_USER` | `--user` | `start`, `apply`, `diff --full` |
+| `MOO_UPSTREAM_PASSWORD` | `--password` | `start`, `apply`, `diff --full` |
+
+CLI args take priority over env vars. Useful for Kubernetes secrets or Docker `--env-file`:
+
+```bash
+docker run --rm -p 3307:3307 \
+  -e MOO_UPSTREAM_USER=root \
+  -e MOO_UPSTREAM_PASSWORD=secret \
+  ghcr.io/theolymp/moo:latest \
+  start --upstream=host.docker.internal:3306
+```
 
 ### status
 
