@@ -33,6 +33,24 @@ docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=secret mariadb:latest
 mysql -h 127.0.0.1 -P 3307 -u root mydb
 ```
 
+### Pre-built container image
+
+```bash
+# Pull pre-built image from GHCR
+docker pull ghcr.io/theolymp/moo:latest
+
+# Run against an upstream MariaDB
+docker run --rm -p 3307:3307 \
+  ghcr.io/theolymp/moo:latest \
+  start --upstream=host.docker.internal:3306 --user=root --password=secret
+```
+
+Available tags:
+- `:latest` — latest released version
+- `:0.1.0`, `:0.1`, `:0` — specific versions and aliases (semver)
+- `:edge` — latest master commit
+- `:master` — same as `:edge`
+
 The upstream user needs `SELECT` and `CREATE TEMPORARY TABLES` — no write privileges are required:
 
 ```sql
