@@ -51,12 +51,12 @@ pub struct StartArgs {
     #[arg(long, default_value = "./dev-overlay")]
     pub overlay: PathBuf,
 
-    /// Database user
-    #[arg(long)]
+    /// Database user (env: MOO_UPSTREAM_USER)
+    #[arg(long, env = "MOO_UPSTREAM_USER")]
     pub user: Option<String>,
 
-    /// Database password
-    #[arg(long)]
+    /// Database password (env: MOO_UPSTREAM_PASSWORD)
+    #[arg(long, env = "MOO_UPSTREAM_PASSWORD")]
     pub password: Option<String>,
 
     /// Named overlay to use within the overlay base directory (default: "default")
@@ -126,12 +126,12 @@ pub struct DiffArgs {
     #[arg(long)]
     pub upstream: Option<String>,
 
-    /// Upstream user (required with --full)
-    #[arg(long)]
+    /// Upstream user (required with --full, env: MOO_UPSTREAM_USER)
+    #[arg(long, env = "MOO_UPSTREAM_USER")]
     pub user: Option<String>,
 
-    /// Upstream password (required with --full)
-    #[arg(long)]
+    /// Upstream password (required with --full, env: MOO_UPSTREAM_PASSWORD)
+    #[arg(long, env = "MOO_UPSTREAM_PASSWORD")]
     pub password: Option<String>,
 
     /// Filter to a specific table
@@ -231,12 +231,12 @@ pub struct ApplyArgs {
     #[arg(long)]
     pub upstream: String,
 
-    /// Upstream database user
-    #[arg(long)]
+    /// Upstream database user (env: MOO_UPSTREAM_USER)
+    #[arg(long, env = "MOO_UPSTREAM_USER")]
     pub user: String,
 
-    /// Upstream database password
-    #[arg(long, default_value = "")]
+    /// Upstream database password (env: MOO_UPSTREAM_PASSWORD)
+    #[arg(long, env = "MOO_UPSTREAM_PASSWORD", default_value = "")]
     pub password: String,
 
     /// Apply only this database (default: all databases in overlay)
