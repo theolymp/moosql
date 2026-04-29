@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
 
 use async_trait::async_trait;
 use mysql_async::prelude::*;
@@ -98,10 +97,8 @@ pub struct CowHandler {
     pk_columns_cache: HashMap<String, String>,
     /// Whether auth passthrough is enabled (clients provide own credentials).
     auth_passthrough: bool,
-    /// Client credentials captured during auth handshake (for passthrough to upstream).
-    client_user: Mutex<Option<String>>,
-    /// Client password captured during auth handshake (for passthrough to upstream).
-    client_password: Mutex<Option<String>>,
+    /// Client (user, password) captured during auth handshake. Write-once.
+    client_credentials: std::sync::OnceLock<(String, String)>,
     /// Whether live query logging to stdout is enabled.
     watch: bool,
     /// Optional filter: only log queries whose SQL or action contains this substring (case-insensitive).
@@ -136,8 +133,7 @@ impl CowHandler {
             dirty_tables_stale: true,
             pk_columns_cache: HashMap::new(),
             auth_passthrough,
-            client_user: Mutex::new(None),
-            client_password: Mutex::new(None),
+            client_credentials: std::sync::OnceLock::new(),
             watch,
             watch_filter,
         }
@@ -180,36 +176,34 @@ impl CowHandler {
         );
     }
 
-    /// Return the effective overlay directory. When auth passthrough is enabled,
-    /// this is a per-user subdirectory under the base overlay dir.
+    /// Client-supplied credentials when auth passthrough is enabled, else None.
+    fn client_creds(&self) -> Option<&(String, String)> {
+        if self.auth_passthrough {
+            self.client_credentials.get()
+        } else {
+            None
+        }
+    }
+
+    /// Effective overlay dir: per-user subdirectory under passthrough, else the base dir.
+    /// Under passthrough without captured credentials yet, falls back to `<base>/default`.
     fn user_overlay_dir(&self) -> PathBuf {
         if self.auth_passthrough {
-            let user = self.client_user.lock().unwrap().clone()
-                .unwrap_or_else(|| "default".to_string());
-            self.overlay_dir.join(&user)
+            let user = self.client_credentials.get().map(|(u, _)| u.as_str()).unwrap_or("default");
+            self.overlay_dir.join(user)
         } else {
             self.overlay_dir.clone()
         }
     }
 
-    /// Return the effective upstream user (client-supplied if passthrough, else configured).
+    /// Effective upstream user (client-supplied under passthrough, else configured).
     fn effective_user(&self) -> String {
-        if self.auth_passthrough {
-            self.client_user.lock().unwrap().clone()
-                .unwrap_or_else(|| self.upstream_user.clone())
-        } else {
-            self.upstream_user.clone()
-        }
+        self.client_creds().map(|(u, _)| u.clone()).unwrap_or_else(|| self.upstream_user.clone())
     }
 
-    /// Return the effective upstream password (client-supplied if passthrough, else configured).
+    /// Effective upstream password (client-supplied under passthrough, else configured).
     fn effective_password(&self) -> String {
-        if self.auth_passthrough {
-            self.client_password.lock().unwrap().clone()
-                .unwrap_or_else(|| self.upstream_password.clone())
-        } else {
-            self.upstream_password.clone()
-        }
+        self.client_creds().map(|(_, p)| p.clone()).unwrap_or_else(|| self.upstream_password.clone())
     }
 
     /// Connect to the upstream MariaDB server with given credentials.
@@ -1840,8 +1834,7 @@ impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for CowHandler {
                 client_user = %user,
                 "Auth passthrough: captured client credentials"
             );
-            *self.client_user.lock().unwrap() = Some(user);
-            *self.client_password.lock().unwrap() = Some(pass);
+            let _ = self.client_credentials.set((user, pass));
         } else {
             info!(
                 conn_id = self.conn_id,
@@ -2527,7 +2520,7 @@ mod tests {
             false,
             None,
         );
-        *handler.client_user.lock().unwrap() = Some("alice".to_string());
+        handler.client_credentials.set(("alice".to_string(), "".to_string())).unwrap();
         assert_eq!(handler.user_overlay_dir(), PathBuf::from("/tmp/overlay/alice"));
     }
 
@@ -2542,8 +2535,8 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(handler.effective_user(), "root");
-        assert_eq!(handler.effective_password(), "secret");
+        assert_eq!(handler.effective_user(), "root".to_string());
+        assert_eq!(handler.effective_password(), "secret".to_string());
     }
 
     #[test]
@@ -2557,10 +2550,9 @@ mod tests {
             false,
             None,
         );
-        *handler.client_user.lock().unwrap() = Some("alice".to_string());
-        *handler.client_password.lock().unwrap() = Some("alicepass".to_string());
-        assert_eq!(handler.effective_user(), "alice");
-        assert_eq!(handler.effective_password(), "alicepass");
+        handler.client_credentials.set(("alice".to_string(), "alicepass".to_string())).unwrap();
+        assert_eq!(handler.effective_user(), "alice".to_string());
+        assert_eq!(handler.effective_password(), "alicepass".to_string());
     }
 
     #[test]
@@ -2575,7 +2567,7 @@ mod tests {
             None,
         );
         // No client creds set, should fall back to configured
-        assert_eq!(handler.effective_user(), "root");
-        assert_eq!(handler.effective_password(), "secret");
+        assert_eq!(handler.effective_user(), "root".to_string());
+        assert_eq!(handler.effective_password(), "secret".to_string());
     }
 }
